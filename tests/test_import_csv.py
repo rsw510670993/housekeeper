@@ -52,6 +52,67 @@ class ImportCsvTest(unittest.TestCase):
             conn.close()
             self.assertEqual(row, ("2026-04-01", "OPENROUTER, INC利用国USN", 1784, "expense", "2026-05-27"))
 
+    def test_dedup_requires_exact_date_store_and_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypay-distinct.csv"
+            db_path = root / "housekeeper.sqlite"
+            base = ["2026/2/14", "STORE A", "user", "card", "once", "1220", "0", "1220", "1220", "0", "0", "2026/3/27"]
+            rows = [
+                base,
+                ["2026/2/15", *base[1:]],
+                [base[0], "STORE B", *base[2:]],
+                [*base[:5], "1221", "0", "1221", "1221", "0", "0", base[11]],
+            ]
+            self.write_csv(csv_path, self.paypay_header(), rows, "utf-8-sig")
+
+            first = import_file(db_path, csv_path)
+            second = import_file(db_path, csv_path)
+
+            conn = sqlite3.connect(db_path)
+            count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+            conn.close()
+            self.assertEqual(first["inserted_count"], 4)
+            self.assertEqual(second["duplicate_count"], 4)
+            self.assertEqual(count, 4)
+
+    def test_same_date_store_amount_is_duplicate_even_if_other_fields_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_csv = root / "first.csv"
+            second_csv = root / "second.csv"
+            db_path = root / "housekeeper.sqlite"
+            first_row = ["2026/2/14", "STORE A", "user-a", "card-a", "once", "1220", "0", "1220", "1220", "0", "0", "2026/3/27"]
+            second_row = ["2026/2/14", "STORE A", "user-b", "card-b", "once", "1220", "0", "1220", "1220", "0", "0", "2026/4/27"]
+            self.write_csv(first_csv, self.paypay_header(), [first_row], "utf-8-sig")
+            self.write_csv(second_csv, self.paypay_header(), [second_row], "utf-8-sig")
+
+            first = import_file(db_path, first_csv)
+            second = import_file(db_path, second_csv)
+
+            self.assertEqual(first["inserted_count"], 1)
+            self.assertEqual(second["duplicate_count"], 1)
+
+    def test_identical_rows_are_kept_but_reimport_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypay-identical.csv"
+            db_path = root / "housekeeper.sqlite"
+            row = ["2026/2/14", "Google", "??*", "PayPay?????", "1?", "1220", "0", "1220", "1220", "0", "0", "2026/3/27"]
+            self.write_csv(csv_path, self.paypay_header(), [row, row], "utf-8-sig")
+
+            first = import_file(db_path, csv_path)
+            second = import_file(db_path, csv_path)
+
+            conn = sqlite3.connect(db_path)
+            count, total = conn.execute("SELECT COUNT(*), SUM(amount) FROM transactions").fetchone()
+            keys = conn.execute("SELECT unique_key FROM transactions ORDER BY id").fetchall()
+            conn.close()
+            self.assertEqual(first["inserted_count"], 2)
+            self.assertEqual(second["duplicate_count"], 2)
+            self.assertEqual((count, total), (2, 2440))
+            self.assertNotEqual(keys[0][0], keys[1][0])
+
     def test_mufg_cp932_import(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

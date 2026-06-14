@@ -4,7 +4,7 @@ declare(strict_types=1);
 session_start();
 require __DIR__ . '/../app/bootstrap.php';
 
-$page = $_GET['page'] ?? 'transactions';
+$page = $_GET['page'] ?? 'charts';
 $config = app_config();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -16,7 +16,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($action === 'login') {
         if (login_with_password((string) ($_POST['password'] ?? ''))) {
-            redirect('?page=transactions');
+            redirect('?page=charts');
         }
         flash('密码不正确。');
         redirect('?page=login');
@@ -33,8 +33,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'save_tags') {
-        save_transaction_tags((int) $_POST['transaction_id'], (string) ($_POST['tags'] ?? ''));
+        $result = append_transaction_tags((int) $_POST['transaction_id'], (string) ($_POST['tags'] ?? ''), isset($_POST['batch_same_name']));
+        if (is_ajax_request()) {
+            json_response($result, $result['ok'] ? 200 : 422);
+        }
+        flash($result['message']);
         redirect('?page=transactions');
+    }
+
+    if ($action === 'create_tag' || $action === 'update_tag' || $action === 'delete_tag') {
+        json_response(handle_tag_action((string) $action), 200);
     }
 
     if ($action === 'save_settings') {
@@ -102,25 +110,127 @@ function handle_upload(array $config): void
     ));
 }
 
-function save_transaction_tags(int $transactionId, string $tagText): void
+function is_ajax_request(): bool
 {
-    $pdo = db();
-    $names = array_values(array_unique(array_filter(array_map(
+    return strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
+        || (string) ($_POST['ajax'] ?? '') === '1';
+}
+
+function json_response(array $payload, int $status = 200): never
+{
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function parse_tag_names(string $tagText): array
+{
+    return array_values(array_unique(array_filter(array_map(
         static fn(string $name): string => trim($name),
         preg_split('/[,?\s]+/u', $tagText) ?: []
     ))));
+}
+
+function transaction_tag_names(PDO $pdo, array $transactionIds): array
+{
+    if (!$transactionIds) {
+        return [];
+    }
+    $placeholders = implode(',', array_fill(0, count($transactionIds), '?'));
+    $stmt = $pdo->prepare("SELECT t.id, COALESCE(GROUP_CONCAT(g.name, ', '), '') AS tag_names FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.id IN ($placeholders) GROUP BY t.id");
+    $stmt->execute($transactionIds);
+    $result = [];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $result[(string) $row['id']] = (string) $row['tag_names'];
+    }
+    return $result;
+}
+
+function append_transaction_tags(int $transactionId, string $tagText, bool $batchSameName): array
+{
+    $pdo = db();
+    $names = parse_tag_names($tagText);
+    if (!$names) {
+        return ['ok' => false, 'message' => '请输入要追加的标签。'];
+    }
+
+    $txStmt = $pdo->prepare('SELECT id, source_type, counterparty_key FROM transactions WHERE id = :id');
+    $txStmt->execute([':id' => $transactionId]);
+    $transaction = $txStmt->fetch(PDO::FETCH_ASSOC);
+    if (!$transaction) {
+        return ['ok' => false, 'message' => '交易不存在。'];
+    }
+
+    if ($batchSameName) {
+        $targetStmt = $pdo->prepare('SELECT id FROM transactions WHERE source_type = :source_type AND counterparty_key = :counterparty_key');
+        $targetStmt->execute([':source_type' => $transaction['source_type'], ':counterparty_key' => $transaction['counterparty_key']]);
+        $targetIds = array_map('intval', $targetStmt->fetchAll(PDO::FETCH_COLUMN));
+    } else {
+        $targetIds = [$transactionId];
+    }
 
     $pdo->beginTransaction();
-    $pdo->prepare('DELETE FROM transaction_tags WHERE transaction_id = :id')->execute([':id' => $transactionId]);
+    $tagIds = [];
     foreach ($names as $name) {
         $stmt = $pdo->prepare('INSERT OR IGNORE INTO tags(name, created_at) VALUES(:name, :created)');
         $stmt->execute([':name' => $name, ':created' => now_utc()]);
-        $tagId = (int) $pdo->query('SELECT id FROM tags WHERE name = ' . $pdo->quote($name))->fetchColumn();
-        $stmt = $pdo->prepare('INSERT INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, :origin, :created)');
-        $stmt->execute([':tx' => $transactionId, ':tag' => $tagId, ':origin' => 'manual', ':created' => now_utc()]);
+        $tagIds[] = (int) $pdo->query('SELECT id FROM tags WHERE name = ' . $pdo->quote($name))->fetchColumn();
+    }
+    $insert = $pdo->prepare('INSERT OR IGNORE INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, :origin, :created)');
+    foreach ($targetIds as $targetId) {
+        foreach ($tagIds as $tagId) {
+            $insert->execute([':tx' => $targetId, ':tag' => $tagId, ':origin' => 'manual', ':created' => now_utc()]);
+        }
     }
     $pdo->commit();
-    flash('标签已保存。');
+
+    return [
+        'ok' => true,
+        'message' => sprintf('标签已追加到 %d 条交易。', count($targetIds)),
+        'updated_tags' => transaction_tag_names($pdo, $targetIds),
+    ];
+}
+
+function handle_tag_action(string $action): array
+{
+    $pdo = db();
+    if ($action === 'create_tag') {
+        $name = trim((string) ($_POST['name'] ?? ''));
+        $color = normalize_tag_color((string) ($_POST['color'] ?? '#3b82f6'));
+        if ($name === '') return ['ok' => false, 'message' => 'Tag 名称不能为空。'];
+        try {
+            $stmt = $pdo->prepare('INSERT INTO tags(name, color, created_at) VALUES(:name, :color, :created)');
+            $stmt->execute([':name' => $name, ':color' => $color, ':created' => now_utc()]);
+        } catch (PDOException) {
+            return ['ok' => false, 'message' => 'Tag 名称已存在。'];
+        }
+        $tag = ['id' => (int) $pdo->lastInsertId(), 'name' => $name, 'color' => $color, 'usage_count' => 0];
+        return ['ok' => true, 'message' => 'Tag 已新增。', 'tag' => $tag, 'row_html' => render_tag_management_row($tag)];
+    }
+
+    $id = (int) ($_POST['tag_id'] ?? 0);
+    if ($action === 'delete_tag') {
+        $stmt = $pdo->prepare('DELETE FROM tags WHERE id = :id');
+        $stmt->execute([':id' => $id]);
+        return ['ok' => true, 'message' => 'Tag 已删除。'];
+    }
+
+    $name = trim((string) ($_POST['name'] ?? ''));
+    $color = normalize_tag_color((string) ($_POST['color'] ?? '#3b82f6'));
+    if ($name === '') return ['ok' => false, 'message' => 'Tag 名称不能为空。'];
+    try {
+        $stmt = $pdo->prepare('UPDATE tags SET name = :name, color = :color WHERE id = :id');
+        $stmt->execute([':name' => $name, ':color' => $color, ':id' => $id]);
+    } catch (PDOException) {
+        return ['ok' => false, 'message' => 'Tag 名称已存在。'];
+    }
+    return ['ok' => true, 'message' => 'Tag 已更新。'];
+}
+
+function normalize_tag_color(string $color): string
+{
+    return preg_match('/^#[0-9a-fA-F]{6}$/', $color) === 1 ? strtolower($color) : '#3b82f6';
 }
 
 function save_settings(array $config): void
@@ -151,6 +261,7 @@ function render_page(string $page, array $config): void
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Housekeeper</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <style>
         body { background: #f6f7f9; }
         .amount-expense { color: #b42318; font-variant-numeric: tabular-nums; }
@@ -158,22 +269,32 @@ function render_page(string $page, array $config): void
         .table td, .table th { vertical-align: middle; }
         .description-subline { font-size: .82rem; }
         .child-row { background: #fbfcff; }
-        .tag-input { min-width: 13rem; }
+        .transaction-table thead th { font-size: .78rem; letter-spacing: .02em; text-transform: uppercase; color: #6c757d; }
+        .transaction-table tbody tr.transaction-row { border-top: 1px solid #eef1f4; }
+        .transaction-table tbody tr.transaction-row:hover { background: #fbfcfd; }
+        .date-stack { min-width: 7.5rem; }
+        .date-stack .date-main { font-weight: 600; font-variant-numeric: tabular-nums; }
+        .amount-cell { min-width: 7.5rem; font-size: 1rem; }
+        .action-cell { width: 1%; white-space: nowrap; }
+        .tag-list { max-width: 18rem; }
+        .tag-list .badge { font-weight: 500; }
     </style>
 </head>
 <body>
 <?php if ($page !== 'login'): ?>
 <nav class="navbar navbar-expand-lg bg-white border-bottom sticky-top">
     <div class="container-fluid px-3 px-lg-4">
-        <a class="navbar-brand fw-semibold" href="?page=transactions">Housekeeper</a>
+        <a class="navbar-brand fw-semibold" href="?page=charts">Housekeeper</a>
         <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav" aria-controls="mainNav" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
         </button>
         <div class="collapse navbar-collapse" id="mainNav">
             <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-                <li class="nav-item"><a class="nav-link <?= $page === 'transactions' ? 'active' : '' ?>" href="?page=transactions">交易</a></li>
-                <li class="nav-item"><a class="nav-link <?= $page === 'upload' ? 'active' : '' ?>" href="?page=upload">上传</a></li>
-                <li class="nav-item"><a class="nav-link <?= $page === 'settings' ? 'active' : '' ?>" href="?page=settings">设置</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'charts' ? 'active' : '' ?>" href="?page=charts"><i class="bi bi-pie-chart me-1"></i>支出图表</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'transactions' ? 'active' : '' ?>" href="?page=transactions"><i class="bi bi-receipt me-1"></i>交易</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'tags' ? 'active' : '' ?>" href="?page=tags"><i class="bi bi-tags me-1"></i>Tag 管理</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'upload' ? 'active' : '' ?>" href="?page=upload"><i class="bi bi-upload me-1"></i>上传</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'settings' ? 'active' : '' ?>" href="?page=settings"><i class="bi bi-gear me-1"></i>设置</a></li>
             </ul>
             <form method="post" class="mb-0">
                 <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
@@ -193,12 +314,105 @@ function render_page(string $page, array $config): void
         render_upload();
     } elseif ($page === 'settings') {
         render_settings($config);
+    } elseif ($page === 'tags') {
+        render_tags_page();
+    } elseif ($page === 'charts') {
+        render_charts_page();
     } else {
         render_transactions();
     }
 ?>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const modal = document.getElementById('tagModal');
+    if (!modal) return;
+    modal.addEventListener('show.bs.modal', (event) => {
+        const button = event.relatedTarget;
+        if (!button) return;
+        const currentTags = button.getAttribute('data-tags') || '';
+        document.getElementById('tagTransactionId').value = button.getAttribute('data-transaction-id') || '';
+        document.getElementById('tagTransactionDescription').textContent = button.getAttribute('data-description') || '';
+        document.getElementById('tagTransactionMeta').textContent = `${button.getAttribute('data-source') || ''} / ${button.getAttribute('data-counterparty') || ''}`;
+        document.getElementById('tagCurrentTags').textContent = currentTags || '无标签';
+        document.getElementById('tagAppendInput').value = '';
+        document.getElementById('batchSameName').checked = false;
+    });
+});
+</script>
+
+<script>
+function showPageFeedback(message, ok = true) {
+    const host = document.getElementById('tagPageFeedback');
+    if (!host) return;
+    const toast = document.createElement('div');
+    toast.className = `toast show align-items-center text-bg-${ok ? 'success' : 'danger'} border-0 mb-2`;
+    toast.innerHTML = `<div class="d-flex"><div class="toast-body"></div><button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>`;
+    toast.querySelector('.toast-body').textContent = message;
+    host.appendChild(toast);
+    setTimeout(() => toast.remove(), 3500);
+}
+
+async function postAjax(formData) {
+    formData.set('ajax', '1');
+    const response = await fetch('?page=transactions', {method: 'POST', body: formData, headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.message || '操作失败');
+    return data;
+}
+
+function renderTagNames(target, names) {
+    target.replaceChildren();
+    const list = names.split(',').map(name => name.trim()).filter(Boolean);
+    if (!list.length) {
+        const empty = document.createElement('span'); empty.className = 'text-body-secondary small'; empty.textContent = '无标签'; target.appendChild(empty); return;
+    }
+    list.forEach(name => { const badge = document.createElement('span'); badge.className = 'badge text-bg-secondary me-1'; badge.textContent = name; target.appendChild(badge); });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const transactionForm = document.getElementById('transactionTagForm');
+    transactionForm?.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const feedback = document.getElementById('tagModalFeedback');
+        try {
+            const data = await postAjax(new FormData(transactionForm));
+            Object.entries(data.updated_tags || {}).forEach(([id, names]) => {
+                document.querySelectorAll(`[data-tag-display="${id}"]`).forEach(node => renderTagNames(node, names));
+                document.querySelectorAll(`[data-transaction-id="${id}"]`).forEach(button => button.setAttribute('data-tags', names));
+            });
+            document.getElementById('tagCurrentTags').textContent = data.updated_tags?.[document.getElementById('tagTransactionId').value] || '无标签';
+            document.getElementById('tagAppendInput').value = '';
+            feedback.className = 'small mt-3 text-success'; feedback.textContent = data.message;
+        } catch (error) { feedback.className = 'small mt-3 text-danger'; feedback.textContent = error.message; }
+    });
+
+    document.addEventListener('submit', async (event) => {
+        const form = event.target.closest('.ajax-tag-form');
+        if (!form) return;
+        event.preventDefault();
+        try {
+            const data = await postAjax(new FormData(form));
+            if (data.row_html) { document.getElementById('tagRows').insertAdjacentHTML('beforeend', data.row_html); form.reset(); form.querySelector('[type="color"]').value = '#3b82f6'; }
+            showPageFeedback(data.message, true);
+        } catch (error) { showPageFeedback(error.message, false); }
+    });
+
+    document.addEventListener('click', async (event) => {
+        const button = event.target.closest('.tag-delete-button');
+        if (!button || !confirm('确定删除该 Tag？交易上的该 Tag 也会移除。')) return;
+        const data = new FormData(); data.set('csrf', document.querySelector('.ajax-tag-form input[name="csrf"]').value); data.set('action', 'delete_tag'); data.set('tag_id', button.dataset.tagId);
+        try { const result = await postAjax(data); button.closest('tr').remove(); showPageFeedback(result.message, true); } catch (error) { showPageFeedback(error.message, false); }
+    });
+
+    if (window.tagExpenseChartData && document.getElementById('tagExpenseChart')) {
+        new Chart(document.getElementById('tagExpenseChart'), {type: 'doughnut', data: {labels: window.tagExpenseChartData.labels, datasets: [{data: window.tagExpenseChartData.values, backgroundColor: window.tagExpenseChartData.colors, borderWidth: 2, borderColor: '#fff'}]}, options: {responsive: true, maintainAspectRatio: false, cutout: '58%', plugins: {legend: {position: 'bottom'}, tooltip: {callbacks: {label: context => `${context.label}: ${Math.round(context.raw).toLocaleString()} (${context.dataset.data.reduce((a,b)=>a+b,0) ? (context.raw / context.dataset.data.reduce((a,b)=>a+b,0) * 100).toFixed(1) : 0}%)`}}}}});
+    }
+});
+</script>
+
 </body>
 </html>
 <?php
@@ -276,15 +490,20 @@ function render_upload(): void
 
 function render_transactions(): void
 {
-    $source = (string) ($_GET['source'] ?? '');
+    $dateFrom = normalize_date_filter((string) ($_GET['date_from'] ?? ''));
+    $dateTo = normalize_date_filter((string) ($_GET['date_to'] ?? ''));
     $tag = (string) ($_GET['tag'] ?? '');
     $untagged = (string) ($_GET['untagged'] ?? '') === '1';
     $params = [];
     $where = ["NOT EXISTS (SELECT 1 FROM transaction_links hidden_l WHERE hidden_l.child_transaction_id = t.id AND hidden_l.link_type = 'card_statement')"];
 
-    if ($source !== '') {
-        $where[] = 't.source_type = :source';
-        $params[':source'] = $source;
+    if ($dateFrom !== '') {
+        $where[] = 't.transaction_date >= :date_from';
+        $params[':date_from'] = $dateFrom;
+    }
+    if ($dateTo !== '') {
+        $where[] = 't.transaction_date <= :date_to';
+        $params[':date_to'] = $dateTo;
     }
     if ($tag !== '') {
         $where[] = 'EXISTS (SELECT 1 FROM transaction_tags tt_filter JOIN tags g_filter ON g_filter.id = tt_filter.tag_id WHERE tt_filter.transaction_id = t.id AND g_filter.name = :tag)';
@@ -317,21 +536,21 @@ function render_transactions(): void
         <form method="get" class="row g-3 align-items-end">
             <input type="hidden" name="page" value="transactions">
             <div class="col-12 col-md-3">
-                <label class="form-label">来源</label>
-                <select name="source" class="form-select">
-                    <option value="">全部</option>
-                    <option value="paypay_card" <?= $source === 'paypay_card' ? 'selected' : '' ?>>PayPay</option>
-                    <option value="mufg_bank" <?= $source === 'mufg_bank' ? 'selected' : '' ?>>MUFG</option>
-                </select>
+                <label class="form-label">开始日期</label>
+                <input type="date" name="date_from" class="form-control" value="<?= h($dateFrom) ?>">
             </div>
             <div class="col-12 col-md-3">
+                <label class="form-label">结束日期</label>
+                <input type="date" name="date_to" class="form-control" value="<?= h($dateTo) ?>">
+            </div>
+            <div class="col-12 col-md-2">
                 <label class="form-label">Tag</label>
                 <select name="tag" class="form-select">
                     <option value="">全部</option>
                     <?php foreach ($tags as $name): ?><option value="<?= h($name) ?>" <?= $tag === $name ? 'selected' : '' ?>><?= h($name) ?></option><?php endforeach; ?>
                 </select>
             </div>
-            <div class="col-12 col-md-3">
+            <div class="col-12 col-md-2">
                 <label class="form-label">未标记</label>
                 <select name="untagged" class="form-select">
                     <option value="">否</option>
@@ -344,53 +563,47 @@ function render_transactions(): void
         </form>
     </div>
 </div>
-<div class="card shadow-sm">
+<div class="card shadow-sm border-0">
     <div class="table-responsive">
-        <table class="table table-sm table-hover mb-0 align-middle">
-            <thead class="table-light"><tr><th>日期</th><th>来源</th><th>描述</th><th class="text-end">金额</th><th>余额 / 还款日</th><th>标签</th></tr></thead>
+        <table class="table transaction-table mb-0 align-middle">
+            <thead class="table-light"><tr><th>日期</th><th>描述</th><th>标签</th><th class="text-end">金额</th><th>余额 / 还款日</th><th class="text-end">操作</th></tr></thead>
             <tbody>
             <?php foreach ($rows as $row): ?>
                 <?php $collapseId = 'children-' . (int) $row['id']; ?>
-                <tr>
-                    <td><?= h($row['transaction_date']) ?></td>
-                    <td><span class="badge text-bg-light border"><?= h(source_label((string) $row['source_type'])) ?></span></td>
+                <tr class="transaction-row">
+                    <td class="date-stack">
+                        <div class="date-main"><?= h($row['transaction_date']) ?></div>
+                        <span class="badge text-bg-light border"><?= h(source_label((string) $row['source_type'])) ?></span>
+                    </td>
                     <td>
-                        <?= render_description($row) ?>
+                        <div class="fw-medium"><?= render_description($row) ?></div>
                         <?php if ((int) $row['child_count'] > 0): ?>
-                            <div class="mt-1">
-                                <button class="btn btn-link btn-sm p-0" type="button" data-bs-toggle="collapse" data-bs-target="#<?= h($collapseId) ?>" aria-expanded="false" aria-controls="<?= h($collapseId) ?>">
-                                    <?= h((string) $row['child_count']) ?> PayPay 明细，合计 <?= h(number_format((int) $row['child_total'])) ?>
-                                </button>
-                            </div>
+                            <button class="btn btn-link btn-sm p-0 mt-1" type="button" data-bs-toggle="collapse" data-bs-target="#<?= h($collapseId) ?>" aria-expanded="false" aria-controls="<?= h($collapseId) ?>">
+                                <?= h((string) $row['child_count']) ?> PayPay 明细，合计 <?= h(number_format((int) $row['child_total'])) ?>
+                            </button>
                         <?php endif; ?>
                     </td>
-                    <td class="text-end <?= $row['direction'] === 'expense' ? 'amount-expense' : 'amount-income' ?>"><?= $row['direction'] === 'expense' ? '-' : '+' ?><?= number_format((int) $row['amount']) ?></td>
+                    <td><div class="tag-list" data-tag-display="<?= h((string) $row['id']) ?>"><?= render_tag_badges((string) $row['tag_names']) ?></div></td>
+                    <td class="text-end amount-cell <?= $row['direction'] === 'expense' ? 'amount-expense' : 'amount-income' ?>"><?= $row['direction'] === 'expense' ? '-' : '+' ?><?= number_format((int) $row['amount']) ?></td>
                     <td><?= h($row['balance'] !== null ? number_format((int) $row['balance']) : $row['payment_date']) ?></td>
-                    <td>
-                        <form method="post" class="d-flex gap-2 align-items-center">
-                            <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
-                            <input type="hidden" name="action" value="save_tags">
-                            <input type="hidden" name="transaction_id" value="<?= h((string) $row['id']) ?>">
-                            <input name="tags" class="form-control form-control-sm tag-input" value="<?= h($row['tag_names']) ?>" placeholder="tag1, tag2">
-                            <button type="submit" class="btn btn-outline-primary btn-sm">保存</button>
-                        </form>
-                    </td>
+                    <td class="text-end action-cell"><?= render_tag_edit_button($row) ?></td>
                 </tr>
                 <?php if ((int) $row['child_count'] > 0): ?>
                     <tr class="child-row">
                         <td colspan="6" class="p-0 border-0">
                             <div class="collapse" id="<?= h($collapseId) ?>">
-                                <div class="p-3 border-top">
+                                <div class="p-3 border-top bg-body-tertiary">
                                     <div class="table-responsive">
-                                        <table class="table table-sm mb-0">
-                                            <thead><tr><th>日期</th><th>店名</th><th class="text-end">金额</th><th>标签</th></tr></thead>
+                                        <table class="table table-sm mb-0 align-middle">
+                                            <thead><tr><th>日期</th><th>店名</th><th>标签</th><th class="text-end">金额</th><th class="text-end">操作</th></tr></thead>
                                             <tbody>
                                             <?php foreach ($childrenByParent[(int) $row['id']] ?? [] as $child): ?>
                                                 <tr>
-                                                    <td><?= h($child['transaction_date']) ?></td>
+                                                    <td class="text-body-secondary"><?= h($child['transaction_date']) ?></td>
                                                     <td><?= render_description($child) ?></td>
+                                                    <td><div class="tag-list" data-tag-display="<?= h((string) $child['id']) ?>"><?= render_tag_badges((string) $child['tag_names']) ?></div></td>
                                                     <td class="text-end amount-expense">-<?= number_format((int) $child['amount']) ?></td>
-                                                    <td><?= render_tag_badges((string) $child['tag_names']) ?></td>
+                                                    <td class="text-end action-cell"><?= render_tag_edit_button($child) ?></td>
                                                 </tr>
                                             <?php endforeach; ?>
                                             </tbody>
@@ -406,7 +619,15 @@ function render_transactions(): void
         </table>
     </div>
 </div>
+<?= render_tag_modal() ?>
 <?php
+}
+
+
+function normalize_date_filter(string $value): string
+{
+    $value = trim($value);
+    return preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) === 1 ? $value : '';
 }
 
 function load_children_by_parent(array $parentIds): array
@@ -434,6 +655,62 @@ function render_description(array $row): string
         $html .= '<div class="text-body-secondary description-subline">' . h($counterparty) . '</div>';
     }
     return $html;
+}
+
+
+function render_tag_edit_button(array $row): string
+{
+    $tags = (string) ($row['tag_names'] ?? '');
+    return '<button type="button" class="btn btn-outline-primary btn-sm" data-bs-toggle="modal" data-bs-target="#tagModal"'
+        . ' data-transaction-id="' . h((string) $row['id']) . '"'
+        . ' data-description="' . h((string) $row['description']) . '"'
+        . ' data-source="' . h(source_label((string) $row['source_type'])) . '"'
+        . ' data-counterparty="' . h((string) $row['counterparty_key']) . '"'
+        . ' data-tags="' . h($tags) . '">编辑</button>';
+}
+
+function render_tag_modal(): string
+{
+    ob_start();
+    ?>
+<div class="modal fade" id="tagModal" tabindex="-1" aria-labelledby="tagModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <form method="post" class="modal-content" id="transactionTagForm">
+            <div class="modal-header">
+                <h2 class="modal-title fs-5" id="tagModalLabel">编辑标签</h2>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+                <input type="hidden" name="action" value="save_tags">
+                <input type="hidden" name="transaction_id" id="tagTransactionId">
+                <div class="mb-3">
+                    <label class="form-label">交易</label>
+                    <div class="form-control-plaintext" id="tagTransactionDescription"></div>
+                    <div class="text-body-secondary small" id="tagTransactionMeta"></div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">现有标签</label>
+                    <div id="tagCurrentTags" class="form-control-plaintext text-body-secondary"></div>
+                </div>
+                <div class="mb-3">
+                    <label for="tagAppendInput" class="form-label">追加标签</label>
+                    <input id="tagAppendInput" name="tags" class="form-control" placeholder="多个标签可用逗号或空格分隔" required>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" value="1" id="batchSameName" name="batch_same_name">
+                    <label class="form-check-label" for="batchSameName">同时追加到完全同名交易</label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="submit" class="btn btn-primary">追加标签</button>
+            </div>
+        </form>
+    </div>
+</div>
+    <?php
+    return (string) ob_get_clean();
 }
 
 function render_tag_badges(string $tagNames): string
@@ -467,6 +744,113 @@ function status_label(string $status): string
         'running' => '处理中',
         default => $status,
     };
+}
+
+function render_tags_page(): void
+{
+    $tags = db()->query("SELECT g.id, g.name, g.color, COUNT(tt.transaction_id) AS usage_count FROM tags g LEFT JOIN transaction_tags tt ON tt.tag_id = g.id GROUP BY g.id ORDER BY g.name")->fetchAll(PDO::FETCH_ASSOC);
+    ?>
+<div class="row g-4">
+    <div class="col-12 col-lg-4">
+        <div class="card shadow-sm border-0">
+            <div class="card-body">
+                <h1 class="h5 mb-3">新增 Tag</h1>
+                <form class="ajax-tag-form" data-action="create_tag">
+                    <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+                    <input type="hidden" name="action" value="create_tag">
+                    <div class="mb-3"><label class="form-label">名称</label><input name="name" class="form-control" required></div>
+                    <div class="mb-3"><label class="form-label">颜色</label><input name="color" type="color" class="form-control form-control-color" value="#3b82f6"></div>
+                    <button class="btn btn-primary" type="submit"><i class="bi bi-plus-lg me-1"></i>新增</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    <div class="col-12 col-lg-8">
+        <div class="card shadow-sm border-0">
+            <div class="card-body border-bottom d-flex justify-content-between align-items-center">
+                <h2 class="h5 mb-0">Tag 列表</h2><span class="text-body-secondary small">平面标签，无层级关系</span>
+            </div>
+            <div class="table-responsive">
+                <table class="table align-middle mb-0"><thead class="table-light"><tr><th>颜色</th><th>名称</th><th>使用次数</th><th class="text-end">操作</th></tr></thead><tbody id="tagRows">
+                <?php foreach ($tags as $tag): ?><?= render_tag_management_row($tag) ?><?php endforeach; ?>
+                </tbody></table>
+            </div>
+        </div>
+    </div>
+</div>
+<div id="tagPageFeedback" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
+<?php
+}
+
+function render_tag_management_row(array $tag): string
+{
+    ob_start(); ?>
+<tr data-tag-row="<?= h((string) $tag['id']) ?>">
+    <td><input form="tag-form-<?= h((string) $tag['id']) ?>" name="color" type="color" class="form-control form-control-color" value="<?= h((string) $tag['color']) ?>"></td>
+    <td><input form="tag-form-<?= h((string) $tag['id']) ?>" name="name" class="form-control" value="<?= h((string) $tag['name']) ?>" required></td>
+    <td><span class="badge text-bg-light border"><?= h((string) $tag['usage_count']) ?></span></td>
+    <td class="text-end">
+        <form id="tag-form-<?= h((string) $tag['id']) ?>" class="ajax-tag-form d-inline" data-action="update_tag">
+            <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="update_tag"><input type="hidden" name="tag_id" value="<?= h((string) $tag['id']) ?>">
+            <button class="btn btn-outline-primary btn-sm" type="submit">保存</button>
+            <button class="btn btn-outline-danger btn-sm tag-delete-button" type="button" data-tag-id="<?= h((string) $tag['id']) ?>">删除</button>
+        </form>
+    </td>
+</tr>
+<?php return (string) ob_get_clean();
+}
+
+function render_charts_page(): void
+{
+    $pdo = db();
+    $latestDate = (string) ($pdo->query("SELECT MAX(transaction_date) FROM transactions WHERE direction = 'expense'")->fetchColumn() ?: date('Y-m-d'));
+    $scope = (string) ($_GET['scope'] ?? 'month');
+    $scope = in_array($scope, ['month', 'year'], true) ? $scope : 'month';
+    $month = preg_match('/^\\d{4}-\\d{2}$/', (string) ($_GET['month'] ?? '')) ? (string) $_GET['month'] : substr($latestDate, 0, 7);
+    $year = preg_match('/^\\d{4}$/', (string) ($_GET['year'] ?? '')) ? (string) $_GET['year'] : substr($latestDate, 0, 4);
+    $period = $scope === 'year' ? $year : $month;
+    $rows = expense_tag_statistics($period, $scope);
+    $total = array_sum(array_column($rows, 'amount'));
+    ?>
+<div class="card shadow-sm border-0 mb-4"><div class="card-body">
+    <div class="d-flex flex-column flex-lg-row justify-content-between gap-3 align-items-lg-end">
+        <div><h1 class="h4 mb-1">Tag 支出比例</h1><div class="text-body-secondary small">多 Tag 交易按 Tag 数量平均分摊；PayPay 总扣款不重复计算。</div></div>
+        <form method="get" class="d-flex flex-wrap gap-2 align-items-end"><input type="hidden" name="page" value="charts">
+            <div><label class="form-label small">统计范围</label><select name="scope" class="form-select"><option value="month" <?= $scope === 'month' ? 'selected' : '' ?>>月份</option><option value="year" <?= $scope === 'year' ? 'selected' : '' ?>>全年</option></select></div>
+            <div><label class="form-label small">月份</label><input type="month" name="month" class="form-control" value="<?= h($month) ?>"></div>
+            <div><label class="form-label small">年份</label><input type="number" name="year" class="form-control" min="2000" max="2100" value="<?= h($year) ?>"></div>
+            <button class="btn btn-primary" type="submit">查看</button>
+        </form>
+    </div>
+</div></div>
+<div class="row g-4"><div class="col-12 col-xl-7"><div class="card shadow-sm border-0"><div class="card-body"><div style="height:420px"><canvas id="tagExpenseChart"></canvas></div></div></div></div>
+<div class="col-12 col-xl-5"><div class="card shadow-sm border-0"><div class="card-body border-bottom"><div class="text-body-secondary small"><?= h($period) ?> 总支出</div><div class="fs-3 fw-semibold"><?= number_format((int) round($total)) ?></div></div><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Tag</th><th class="text-end">金额</th><th class="text-end">占比</th></tr></thead><tbody><?php foreach ($rows as $row): ?><tr><td><span class="badge me-2" style="background:<?= h($row['color']) ?>">&nbsp;</span><?= h($row['name']) ?></td><td class="text-end"><?= number_format((int) round($row['amount'])) ?></td><td class="text-end"><?= $total > 0 ? number_format($row['amount'] / $total * 100, 1) : '0.0' ?>%</td></tr><?php endforeach; ?></tbody></table></div></div></div></div>
+<script>window.tagExpenseChartData = <?= json_encode(['labels' => array_column($rows, 'name'), 'values' => array_column($rows, 'amount'), 'colors' => array_column($rows, 'color')], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
+<?php
+}
+
+function expense_tag_statistics(string $period, string $scope): array
+{
+    $pdo = db();
+    $dateCondition = $scope === 'year' ? "substr(t.transaction_date, 1, 4) = :period" : "substr(t.transaction_date, 1, 7) = :period";
+    $stmt = $pdo->prepare("SELECT t.id, t.amount, g.name, g.color FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.direction = 'expense' AND $dateCondition AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement') ORDER BY t.id");
+    $stmt->execute([':period' => $period]);
+    $transactions = [];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $id = (int) $row['id'];
+        $transactions[$id]['amount'] = (int) $row['amount'];
+        if ($row['name'] !== null) $transactions[$id]['tags'][] = ['name' => (string) $row['name'], 'color' => (string) $row['color']];
+    }
+    $totals = [];
+    foreach ($transactions as $transaction) {
+        $tags = $transaction['tags'] ?? [['name' => '未标记', 'color' => '#adb5bd']];
+        $share = $transaction['amount'] / count($tags);
+        foreach ($tags as $tag) {
+            $totals[$tag['name']]['name'] = $tag['name']; $totals[$tag['name']]['color'] = $tag['color']; $totals[$tag['name']]['amount'] = ($totals[$tag['name']]['amount'] ?? 0) + $share;
+        }
+    }
+    usort($totals, static fn(array $a, array $b): int => $b['amount'] <=> $a['amount']);
+    return array_values($totals);
 }
 
 function render_settings(array $config): void

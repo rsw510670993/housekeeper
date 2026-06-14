@@ -153,6 +153,16 @@ def transaction_unique_key(source_type: str, item: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def transaction_dedup_signature(source_type: str, item: dict[str, Any]) -> tuple[str, str, str, int, str]:
+    return (
+        source_type,
+        item["transaction_date"],
+        item["counterparty_key"],
+        item["amount"],
+        item["direction"],
+    )
+
+
 def normalize_paypay(row: dict[str, str]) -> dict[str, Any]:
     description = normalize_key(row["利用店名・商品名"])
     amount = parse_int(row.get("利用金額"))
@@ -199,11 +209,17 @@ def normalize_mufg(row: dict[str, str]) -> dict[str, Any]:
 def normalize_rows(source_type: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     normalizer = normalize_paypay if source_type == "paypay_card" else normalize_mufg
     items: list[dict[str, Any]] = []
+    occurrence_counts: dict[tuple[str, str, str, int, str], int] = {}
     for row in rows:
         if not any((value or "").strip() for value in row.values()):
             continue
         item = normalizer(row)
-        item["unique_key"] = transaction_unique_key(source_type, item)
+        dedup_signature = transaction_dedup_signature(source_type, item)
+        occurrence_counts[dedup_signature] = occurrence_counts.get(dedup_signature, 0) + 1
+        occurrence = occurrence_counts[dedup_signature]
+        base_unique_key = transaction_unique_key(source_type, item)
+        item["dedup_occurrence"] = occurrence
+        item["unique_key"] = base_unique_key if occurrence == 1 else f"{base_unique_key}:{occurrence}"
         items.append(item)
     return items
 
@@ -333,11 +349,25 @@ def import_file(db_path: Path, csv_path: Path, allowed_sources: set[str] | None 
             raise ValueError(f"Source is disabled: {source_type}")
         items = normalize_rows(source_type, rows)
         for item in items:
-            existing = conn.execute(
-                "SELECT id FROM transactions WHERE source_type = ? AND unique_key = ?",
-                (source_type, item["unique_key"]),
-            ).fetchone()
-            if existing:
+            existing_count = conn.execute(
+                """
+SELECT COUNT(*)
+FROM transactions
+WHERE source_type = ?
+  AND transaction_date = ?
+  AND counterparty_key = ?
+  AND amount = ?
+  AND direction = ?
+""",
+                (
+                    source_type,
+                    item["transaction_date"],
+                    item["counterparty_key"],
+                    item["amount"],
+                    item["direction"],
+                ),
+            ).fetchone()[0]
+            if int(existing_count) >= item["dedup_occurrence"]:
                 duplicate_count += 1
                 continue
 
