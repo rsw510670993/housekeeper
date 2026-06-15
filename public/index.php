@@ -33,7 +33,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'save_tags') {
-        $result = append_transaction_tags((int) $_POST['transaction_id'], (string) ($_POST['tags'] ?? ''), isset($_POST['batch_same_name']));
+        $result = set_transaction_tags((int) $_POST['transaction_id'], (string) ($_POST['tags'] ?? ''), isset($_POST['batch_same_name']));
         if (is_ajax_request()) {
             json_response($result, $result['ok'] ? 200 : 422);
         }
@@ -128,7 +128,7 @@ function parse_tag_names(string $tagText): array
 {
     return array_values(array_unique(array_filter(array_map(
         static fn(string $name): string => trim($name),
-        preg_split('/[,?\s]+/u', $tagText) ?: []
+        preg_split('/[,\x{FF0C}\s]+/u', $tagText) ?: []
     ))));
 }
 
@@ -147,13 +147,10 @@ function transaction_tag_names(PDO $pdo, array $transactionIds): array
     return $result;
 }
 
-function append_transaction_tags(int $transactionId, string $tagText, bool $batchSameName): array
+function set_transaction_tags(int $transactionId, string $tagText, bool $batchSameName): array
 {
     $pdo = db();
     $names = parse_tag_names($tagText);
-    if (!$names) {
-        return ['ok' => false, 'message' => '请输入要追加的标签。'];
-    }
 
     $txStmt = $pdo->prepare('SELECT id, source_type, counterparty_key FROM transactions WHERE id = :id');
     $txStmt->execute([':id' => $transactionId]);
@@ -177,8 +174,10 @@ function append_transaction_tags(int $transactionId, string $tagText, bool $batc
         $stmt->execute([':name' => $name, ':created' => now_utc()]);
         $tagIds[] = (int) $pdo->query('SELECT id FROM tags WHERE name = ' . $pdo->quote($name))->fetchColumn();
     }
-    $insert = $pdo->prepare('INSERT OR IGNORE INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, :origin, :created)');
+    $delete = $pdo->prepare('DELETE FROM transaction_tags WHERE transaction_id = :tx');
+    $insert = $pdo->prepare('INSERT INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, :origin, :created)');
     foreach ($targetIds as $targetId) {
+        $delete->execute([':tx' => $targetId]);
         foreach ($tagIds as $tagId) {
             $insert->execute([':tx' => $targetId, ':tag' => $tagId, ':origin' => 'manual', ':created' => now_utc()]);
         }
@@ -187,7 +186,7 @@ function append_transaction_tags(int $transactionId, string $tagText, bool $batc
 
     return [
         'ok' => true,
-        'message' => sprintf('标签已追加到 %d 条交易。', count($targetIds)),
+        'message' => sprintf('已更新 %d 条交易的标签。', count($targetIds)),
         'updated_tags' => transaction_tag_names($pdo, $targetIds),
     ];
 }
@@ -326,6 +325,47 @@ function render_page(string $page, array $config): void
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script>
+let selectedTransactionTags = [];
+
+function renderSelectedTransactionTags() {
+    const host = document.getElementById('tagCurrentTags');
+    const hidden = document.getElementById('tagSelectedValues');
+    if (!host || !hidden) return;
+    host.replaceChildren();
+    hidden.value = selectedTransactionTags.join(', ');
+    if (!selectedTransactionTags.length) {
+        const empty = document.createElement('span');
+        empty.className = 'text-body-secondary small';
+        empty.textContent = '\u65e0\u6807\u7b7e';
+        host.appendChild(empty);
+        return;
+    }
+    selectedTransactionTags.forEach(name => {
+        const badge = document.createElement('span');
+        badge.className = 'badge text-bg-secondary d-inline-flex align-items-center gap-2 py-2';
+        const label = document.createElement('span');
+        label.textContent = name;
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn-close btn-close-white';
+        remove.style.fontSize = '0.55rem';
+        remove.setAttribute('aria-label', `\u79fb\u9664 ${name}`);
+        remove.addEventListener('click', () => {
+            selectedTransactionTags = selectedTransactionTags.filter(tag => tag !== name);
+            renderSelectedTransactionTags();
+        });
+        badge.append(label, remove);
+        host.appendChild(badge);
+    });
+}
+
+function addSelectedTransactionTag(name) {
+    const normalized = name.trim();
+    if (!normalized || selectedTransactionTags.includes(normalized)) return;
+    selectedTransactionTags.push(normalized);
+    renderSelectedTransactionTags();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const modal = document.getElementById('tagModal');
     if (!modal) return;
@@ -336,9 +376,12 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('tagTransactionId').value = button.getAttribute('data-transaction-id') || '';
         document.getElementById('tagTransactionDescription').textContent = button.getAttribute('data-description') || '';
         document.getElementById('tagTransactionMeta').textContent = `${button.getAttribute('data-source') || ''} / ${button.getAttribute('data-counterparty') || ''}`;
-        document.getElementById('tagCurrentTags').textContent = currentTags || '无标签';
+        selectedTransactionTags = currentTags.split(',').map(name => name.trim()).filter(Boolean);
+        renderSelectedTransactionTags();
         document.getElementById('tagAppendInput').value = '';
         document.getElementById('batchSameName').checked = false;
+        const feedback = document.getElementById('tagModalFeedback');
+        if (feedback) feedback.textContent = '';
     });
 });
 </script>
@@ -374,18 +417,72 @@ function renderTagNames(target, names) {
 
 document.addEventListener('DOMContentLoaded', () => {
     const transactionForm = document.getElementById('transactionTagForm');
+    const tagInput = document.getElementById('tagAppendInput');
+    const suggestionBox = document.getElementById('tagSuggestions');
+    const availableTags = (() => { try { return JSON.parse(document.getElementById('availableTagNames')?.textContent || '[]'); } catch { return []; } })();
+    let activeSuggestion = -1;
+
+    function currentTagFragment() {
+        return (tagInput?.value || '').split(/[,\uFF0C\s]+/).pop().trim();
+    }
+
+    function chooseSuggestion(name) {
+        addSelectedTransactionTag(name);
+        tagInput.value = '';
+        suggestionBox.classList.add('d-none');
+        activeSuggestion = -1;
+        tagInput.focus();
+    }
+
+    function renderSuggestions() {
+        if (!tagInput || !suggestionBox) return;
+        const fragment = currentTagFragment().toLocaleLowerCase();
+        const matches = availableTags.filter(name => !selectedTransactionTags.includes(name) && (!fragment || name.toLocaleLowerCase().includes(fragment))).slice(0, 8);
+        suggestionBox.replaceChildren();
+        activeSuggestion = -1;
+        if (!matches.length || (!fragment && !tagInput.value)) { suggestionBox.classList.add('d-none'); return; }
+        matches.forEach(name => {
+            const button = document.createElement('button');
+            button.type = 'button'; button.className = 'list-group-item list-group-item-action'; button.textContent = name;
+            button.addEventListener('mousedown', event => { event.preventDefault(); chooseSuggestion(name); });
+            suggestionBox.appendChild(button);
+        });
+        suggestionBox.classList.remove('d-none');
+    }
+
+    tagInput?.addEventListener('input', renderSuggestions);
+    tagInput?.addEventListener('focus', renderSuggestions);
+    tagInput?.addEventListener('blur', () => setTimeout(() => suggestionBox?.classList.add('d-none'), 120));
+    tagInput?.addEventListener('keydown', event => {
+        const items = [...suggestionBox.querySelectorAll('button')];
+        if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && items.length && !suggestionBox.classList.contains('d-none')) {
+            event.preventDefault();
+            activeSuggestion = event.key === 'ArrowDown' ? (activeSuggestion + 1) % items.length : (activeSuggestion - 1 + items.length) % items.length;
+            items.forEach((item, index) => item.classList.toggle('active', index === activeSuggestion));
+        } else if (event.key === 'Enter') {
+            event.preventDefault();
+            if (activeSuggestion >= 0 && items[activeSuggestion]) chooseSuggestion(items[activeSuggestion].textContent);
+            else {
+                addSelectedTransactionTag(currentTagFragment());
+                tagInput.value = '';
+                suggestionBox.classList.add('d-none');
+            }
+        } else if (event.key === 'Escape') suggestionBox.classList.add('d-none');
+    });
+
     transactionForm?.addEventListener('submit', async (event) => {
         event.preventDefault();
         const feedback = document.getElementById('tagModalFeedback');
         try {
+            addSelectedTransactionTag(currentTagFragment());
+            tagInput.value = '';
             const data = await postAjax(new FormData(transactionForm));
             Object.entries(data.updated_tags || {}).forEach(([id, names]) => {
                 document.querySelectorAll(`[data-tag-display="${id}"]`).forEach(node => renderTagNames(node, names));
                 document.querySelectorAll(`[data-transaction-id="${id}"]`).forEach(button => button.setAttribute('data-tags', names));
             });
-            document.getElementById('tagCurrentTags').textContent = data.updated_tags?.[document.getElementById('tagTransactionId').value] || '无标签';
-            document.getElementById('tagAppendInput').value = '';
             feedback.className = 'small mt-3 text-success'; feedback.textContent = data.message;
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('tagModal')).hide();
         } catch (error) { feedback.className = 'small mt-3 text-danger'; feedback.textContent = error.message; }
     });
 
@@ -619,7 +716,7 @@ function render_transactions(): void
         </table>
     </div>
 </div>
-<?= render_tag_modal() ?>
+<?= render_tag_modal($tags) ?>
 <?php
 }
 
@@ -669,7 +766,7 @@ function render_tag_edit_button(array $row): string
         . ' data-tags="' . h($tags) . '">编辑</button>';
 }
 
-function render_tag_modal(): string
+function render_tag_modal(array $tagNames): string
 {
     ob_start();
     ?>
@@ -690,21 +787,25 @@ function render_tag_modal(): string
                     <div class="text-body-secondary small" id="tagTransactionMeta"></div>
                 </div>
                 <div class="mb-3">
-                    <label class="form-label">现有标签</label>
-                    <div id="tagCurrentTags" class="form-control-plaintext text-body-secondary"></div>
+                    <label class="form-label">当前标签</label>
+                    <div id="tagCurrentTags" class="d-flex flex-wrap gap-2"></div>
+                    <input type="hidden" name="tags" id="tagSelectedValues">
+                    <div class="form-text">点击标签右侧的 × 即可移除。</div>
                 </div>
-                <div class="mb-3">
-                    <label for="tagAppendInput" class="form-label">追加标签</label>
-                    <input id="tagAppendInput" name="tags" class="form-control" placeholder="多个标签可用逗号或空格分隔" required>
+                <div class="mb-3 position-relative">
+                    <label for="tagAppendInput" class="form-label">添加标签</label>
+                    <input id="tagAppendInput" class="form-control" placeholder="输入 Tag 名称并选择，或按 Enter 新增" autocomplete="off">
+                    <div id="tagSuggestions" class="list-group position-absolute start-0 end-0 shadow-sm mt-1 d-none" style="z-index:1080; max-height:220px; overflow-y:auto"></div>
+                    <script type="application/json" id="availableTagNames"><?= json_encode(array_values($tagNames), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?></script>
                 </div>
                 <div class="form-check">
                     <input class="form-check-input" type="checkbox" value="1" id="batchSameName" name="batch_same_name">
-                    <label class="form-check-label" for="batchSameName">同时追加到完全同名交易</label>
+                    <label class="form-check-label" for="batchSameName">同时替换完全同名交易的标签</label>
                 </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
-                <button type="submit" class="btn btn-primary">追加标签</button>
+                <button type="submit" class="btn btn-primary">保存标签</button>
             </div>
         </form>
     </div>
