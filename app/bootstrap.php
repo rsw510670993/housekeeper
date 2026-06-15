@@ -29,6 +29,7 @@ function default_config(): array
         'python_command' => 'python',
         'sources' => [
             'paypay_card' => true,
+            'epos_card' => true,
             'mufg_bank' => true,
         ],
     ];
@@ -139,21 +140,75 @@ CREATE TABLE IF NOT EXISTS transaction_links (
     FOREIGN KEY(parent_transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
     FOREIGN KEY(child_transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transactions_date_id ON transactions(transaction_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_direction_date ON transactions(direction, transaction_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_source_payment ON transactions(source_type, payment_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_dedup ON transactions(source_type, transaction_date, counterparty_key, amount, direction);
+CREATE INDEX IF NOT EXISTS idx_transactions_source_counterparty ON transactions(source_type, counterparty_key);
+CREATE INDEX IF NOT EXISTS idx_transactions_cancellation_match ON transactions(direction, source_type, transaction_date, counterparty_key, amount, payment_date, id);
+CREATE INDEX IF NOT EXISTS idx_transactions_statement_parent ON transactions(source_type, direction, transaction_date, amount);
+CREATE INDEX IF NOT EXISTS idx_transaction_links_type_parent ON transaction_links(link_type, parent_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_links_type_child ON transaction_links(link_type, child_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_tags_tag ON transaction_tags(tag_id, transaction_id);
+CREATE INDEX IF NOT EXISTS idx_imports_created ON imports(created_at DESC);
 SQL);
-    reconcile_card_statement_links($pdo);
+    $migrationKey = 'link_reconcile_v1';
+    $stmt = $pdo->prepare('SELECT 1 FROM app_meta WHERE key = :key');
+    $stmt->execute([':key' => $migrationKey]);
+    if ($stmt->fetchColumn() === false) {
+        reconcile_cancellation_links($pdo);
+        reconcile_card_statement_links($pdo);
+        $stmt = $pdo->prepare('INSERT OR REPLACE INTO app_meta(key, value) VALUES(:key, :value)');
+        $stmt->execute([':key' => $migrationKey, ':value' => now_utc()]);
+    }
+}
+
+function reconcile_cancellation_links(PDO $pdo): void
+{
+    $pdo->exec("DELETE FROM transaction_links WHERE link_type = 'cancellation'");
+    $createdAt = $pdo->quote(now_utc());
+    $pdo->exec("
+        WITH expenses AS (
+            SELECT id, source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') AS payment_date,
+                   ROW_NUMBER() OVER (PARTITION BY source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') ORDER BY id) AS occurrence
+            FROM transactions
+            WHERE direction = 'expense'
+        ),
+        incomes AS (
+            SELECT id, source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') AS payment_date,
+                   ROW_NUMBER() OVER (PARTITION BY source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') ORDER BY id) AS occurrence
+            FROM transactions
+            WHERE direction = 'income'
+        )
+        INSERT OR IGNORE INTO transaction_links(parent_transaction_id, child_transaction_id, link_type, created_at)
+        SELECT e.id, i.id, 'cancellation', $createdAt
+        FROM expenses e
+        JOIN incomes i
+          ON i.source_type = e.source_type
+         AND i.transaction_date = e.transaction_date
+         AND i.counterparty_key = e.counterparty_key
+         AND i.amount = e.amount
+         AND i.payment_date = e.payment_date
+         AND i.occurrence = e.occurrence
+    ");
 }
 
 function reconcile_card_statement_links(PDO $pdo): void
 {
     $pdo->exec("DELETE FROM transaction_links WHERE link_type = 'card_statement'");
-    $groups = $pdo->query("
-        SELECT payment_date, SUM(amount) AS total_amount
-        FROM transactions
+
+    $paypayGroups = $pdo->query("
+        SELECT payment_date, SUM(CASE WHEN direction = 'expense' THEN amount ELSE -amount END) AS total_amount
+        FROM transactions t
         WHERE source_type = 'paypay_card' AND payment_date IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id))
         GROUP BY payment_date
     ")->fetchAll(PDO::FETCH_ASSOC);
-
-    foreach ($groups as $group) {
+    foreach ($paypayGroups as $group) {
         $stmt = $pdo->prepare("
             SELECT id
             FROM transactions
@@ -170,30 +225,58 @@ function reconcile_card_statement_links(PDO $pdo): void
             ':total_amount' => (int) $group['total_amount'],
         ]);
         $parentId = $stmt->fetchColumn();
-        if ($parentId === false) {
-            continue;
+        if ($parentId !== false) {
+            link_statement_children($pdo, (int) $parentId, 'paypay_card', 'payment_date = ?', [(string) $group['payment_date']]);
         }
+    }
 
-        $childStmt = $pdo->prepare("
+    $eposGroups = $pdo->query("
+        SELECT substr(payment_date, 1, 7) AS payment_month, SUM(CASE WHEN direction = 'expense' THEN amount ELSE -amount END) AS total_amount
+        FROM transactions t
+        WHERE source_type = 'epos_card' AND payment_date IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id))
+        GROUP BY substr(payment_date, 1, 7)
+    ")->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($eposGroups as $group) {
+        $stmt = $pdo->prepare("
             SELECT id
             FROM transactions
-            WHERE source_type = 'paypay_card' AND payment_date = :payment_date
-            ORDER BY transaction_date, id
+            WHERE source_type = 'mufg_bank'
+              AND substr(transaction_date, 1, 7) = :payment_month
+              AND amount = :total_amount
+              AND direction = 'expense'
+              AND (description LIKE '%エポスカ-ド%' OR counterparty_key LIKE '%エポスカ-ド%' OR description LIKE '%EPOS%' OR counterparty_key LIKE '%EPOS%')
+            ORDER BY id DESC
+            LIMIT 1
         ");
-        $childStmt->execute([':payment_date' => $group['payment_date']]);
-        $insert = $pdo->prepare("
-            INSERT OR IGNORE INTO transaction_links(parent_transaction_id, child_transaction_id, link_type, created_at)
-            VALUES(:parent_id, :child_id, 'card_statement', :created_at)
-        ");
-        foreach ($childStmt->fetchAll(PDO::FETCH_COLUMN) as $childId) {
-            $insert->execute([
-                ':parent_id' => (int) $parentId,
-                ':child_id' => (int) $childId,
-                ':created_at' => now_utc(),
-            ]);
+        $stmt->execute([
+            ':payment_month' => $group['payment_month'],
+            ':total_amount' => (int) $group['total_amount'],
+        ]);
+        $parentId = $stmt->fetchColumn();
+        if ($parentId !== false) {
+            link_statement_children($pdo, (int) $parentId, 'epos_card', 'substr(payment_date, 1, 7) = ?', [(string) $group['payment_month']]);
         }
     }
 }
+
+function link_statement_children(PDO $pdo, int $parentId, string $sourceType, string $paymentCondition, array $paymentParams): void
+{
+    $childStmt = $pdo->prepare("SELECT id FROM transactions t WHERE source_type = ? AND $paymentCondition AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id)) ORDER BY transaction_date, id");
+    $childStmt->execute([$sourceType, ...$paymentParams]);
+    $insert = $pdo->prepare("
+        INSERT OR IGNORE INTO transaction_links(parent_transaction_id, child_transaction_id, link_type, created_at)
+        VALUES(:parent_id, :child_id, 'card_statement', :created_at)
+    ");
+    foreach ($childStmt->fetchAll(PDO::FETCH_COLUMN) as $childId) {
+        $insert->execute([
+            ':parent_id' => $parentId,
+            ':child_id' => (int) $childId,
+            ':created_at' => now_utc(),
+        ]);
+    }
+}
+
 
 function current_session(): ?array
 {

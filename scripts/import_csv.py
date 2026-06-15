@@ -16,6 +16,7 @@ from typing import Any
 
 PAYPAY_HEADERS = {"利用日/キャンセル日", "利用店名・商品名", "利用金額", "当月お支払日"}
 MUFG_HEADERS = {"日付", "摘要", "摘要内容", "支払い金額", "預かり金額", "差引残高"}
+EPOS_HEADERS = {"ご利用年月日", "ご利用場所", "ご利用金額（キャッシングでは元金になります）", "お支払開始月"}
 
 
 def now_utc() -> str:
@@ -83,6 +84,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_transactions_date_id ON transactions(transaction_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_direction_date ON transactions(direction, transaction_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_source_payment ON transactions(source_type, payment_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_dedup ON transactions(source_type, transaction_date, counterparty_key, amount, direction);
+CREATE INDEX IF NOT EXISTS idx_transactions_source_counterparty ON transactions(source_type, counterparty_key);
+CREATE INDEX IF NOT EXISTS idx_transactions_cancellation_match ON transactions(direction, source_type, transaction_date, counterparty_key, amount, payment_date, id);
+CREATE INDEX IF NOT EXISTS idx_transactions_statement_parent ON transactions(source_type, direction, transaction_date, amount);
+CREATE INDEX IF NOT EXISTS idx_transaction_links_type_parent ON transaction_links(link_type, parent_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_links_type_child ON transaction_links(link_type, child_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_tags_tag ON transaction_tags(tag_id, transaction_id);
+CREATE INDEX IF NOT EXISTS idx_imports_created ON imports(created_at DESC);
 """
     )
 
@@ -98,8 +110,13 @@ def decode_csv(path: Path) -> str:
 
 
 def read_rows(path: Path) -> list[dict[str, str]]:
-    text = decode_csv(path)
-    return list(csv.DictReader(text.splitlines()))
+    lines = decode_csv(path).splitlines()
+    known_headers = (PAYPAY_HEADERS, MUFG_HEADERS, EPOS_HEADERS)
+    for index, line in enumerate(lines[:10]):
+        parsed = next(csv.reader([line]), [])
+        if any(required.issubset(set(parsed)) for required in known_headers):
+            return list(csv.DictReader(lines[index:]))
+    return list(csv.DictReader(lines))
 
 
 def normalize_key(value: str) -> str:
@@ -119,12 +136,22 @@ def parse_int(value: str | None) -> int | None:
 
 def parse_date(value: str) -> str:
     normalized = normalize_key(value)
-    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y年%m月%d日"):
         try:
             return datetime.strptime(normalized, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
     raise ValueError(f"Unsupported date: {value}")
+
+
+def parse_month(value: str) -> str:
+    normalized = normalize_key(value)
+    for fmt in ("%Y年%m月", "%Y/%m", "%Y-%m"):
+        try:
+            return datetime.strptime(normalized, fmt).strftime("%Y-%m-01")
+        except ValueError:
+            pass
+    raise ValueError(f"Unsupported month: {value}")
 
 
 def detect_source(rows: list[dict[str, str]]) -> str:
@@ -135,6 +162,8 @@ def detect_source(rows: list[dict[str, str]]) -> str:
         return "paypay_card"
     if MUFG_HEADERS.issubset(headers):
         return "mufg_bank"
+    if EPOS_HEADERS.issubset(headers):
+        return "epos_card"
     raise ValueError(f"Unsupported CSV headers: {', '.join(headers)}")
 
 
@@ -180,6 +209,24 @@ def normalize_paypay(row: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def normalize_epos(row: dict[str, str]) -> dict[str, Any]:
+    description = normalize_key(row.get("ご利用場所", "") or row.get("ご利用内容", ""))
+    amount = parse_int(row.get("ご利用金額（キャッシングでは元金になります）"))
+    if not description or amount is None:
+        raise ValueError("EPOS row has empty description or amount")
+    payment_month = row.get("お支払開始月", "")
+    return {
+        "transaction_date": parse_date(row["ご利用年月日"]),
+        "description": description,
+        "counterparty_key": description,
+        "amount": abs(amount),
+        "direction": "expense" if amount >= 0 else "income",
+        "balance": None,
+        "payment_date": parse_month(payment_month) if payment_month else None,
+        "raw": row,
+    }
+
+
 def normalize_mufg(row: dict[str, str]) -> dict[str, Any]:
     summary = normalize_key(row.get("摘要", ""))
     detail = normalize_key(row.get("摘要内容", ""))
@@ -207,11 +254,18 @@ def normalize_mufg(row: dict[str, str]) -> dict[str, Any]:
 
 
 def normalize_rows(source_type: str, rows: list[dict[str, str]]) -> list[dict[str, Any]]:
-    normalizer = normalize_paypay if source_type == "paypay_card" else normalize_mufg
+    normalizers = {
+        "paypay_card": normalize_paypay,
+        "mufg_bank": normalize_mufg,
+        "epos_card": normalize_epos,
+    }
+    normalizer = normalizers[source_type]
     items: list[dict[str, Any]] = []
     occurrence_counts: dict[tuple[str, str, str, int, str], int] = {}
     for row in rows:
         if not any((value or "").strip() for value in row.values()):
+            continue
+        if source_type == "epos_card" and not (row.get("ご利用年月日") or "").strip():
             continue
         item = normalizer(row)
         dedup_signature = transaction_dedup_signature(source_type, item)
@@ -282,18 +336,53 @@ VALUES(?, ?, 'auto', ?)
         )
 
 
+def reconcile_cancellation_links(conn: sqlite3.Connection) -> int:
+    conn.execute("DELETE FROM transaction_links WHERE link_type = 'cancellation'")
+    before = conn.total_changes
+    conn.execute(
+        """
+WITH expenses AS (
+    SELECT id, source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') AS payment_date,
+           ROW_NUMBER() OVER (PARTITION BY source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') ORDER BY id) AS occurrence
+    FROM transactions
+    WHERE direction = 'expense'
+),
+incomes AS (
+    SELECT id, source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') AS payment_date,
+           ROW_NUMBER() OVER (PARTITION BY source_type, transaction_date, counterparty_key, amount, COALESCE(payment_date, '') ORDER BY id) AS occurrence
+    FROM transactions
+    WHERE direction = 'income'
+)
+INSERT OR IGNORE INTO transaction_links(parent_transaction_id, child_transaction_id, link_type, created_at)
+SELECT e.id, i.id, 'cancellation', ?
+FROM expenses e
+JOIN incomes i
+  ON i.source_type = e.source_type
+ AND i.transaction_date = e.transaction_date
+ AND i.counterparty_key = e.counterparty_key
+ AND i.amount = e.amount
+ AND i.payment_date = e.payment_date
+ AND i.occurrence = e.occurrence
+""",
+        (now_utc(),),
+    )
+    return conn.total_changes - before
+
+
 def reconcile_card_statement_links(conn: sqlite3.Connection) -> int:
     conn.execute("DELETE FROM transaction_links WHERE link_type = 'card_statement'")
-    groups = conn.execute(
+    linked_count = 0
+
+    paypay_groups = conn.execute(
         """
-SELECT payment_date, SUM(amount) AS total_amount
-FROM transactions
+SELECT payment_date, SUM(CASE WHEN direction = 'expense' THEN amount ELSE -amount END) AS total_amount
+FROM transactions t
 WHERE source_type = 'paypay_card' AND payment_date IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id))
 GROUP BY payment_date
 """
     ).fetchall()
-    linked_count = 0
-    for payment_date, total_amount in groups:
+    for payment_date, total_amount in paypay_groups:
         parent = conn.execute(
             """
 SELECT id
@@ -308,27 +397,58 @@ LIMIT 1
 """,
             (payment_date, int(total_amount)),
         ).fetchone()
-        if parent is None:
-            continue
-        child_rows = conn.execute(
+        if parent is not None:
+            linked_count += link_statement_children(conn, int(parent[0]), "paypay_card", "payment_date = ?", (payment_date,))
+
+    epos_groups = conn.execute(
+        """
+SELECT substr(payment_date, 1, 7) AS payment_month, SUM(CASE WHEN direction = 'expense' THEN amount ELSE -amount END) AS total_amount
+FROM transactions t
+WHERE source_type = 'epos_card' AND payment_date IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id))
+GROUP BY substr(payment_date, 1, 7)
+"""
+    ).fetchall()
+    for payment_month, total_amount in epos_groups:
+        parent = conn.execute(
             """
 SELECT id
 FROM transactions
-WHERE source_type = 'paypay_card' AND payment_date = ?
-ORDER BY transaction_date, id
+WHERE source_type = 'mufg_bank'
+  AND substr(transaction_date, 1, 7) = ?
+  AND amount = ?
+  AND direction = 'expense'
+  AND (description LIKE '%エポスカ-ド%' OR counterparty_key LIKE '%エポスカ-ド%' OR description LIKE '%EPOS%' OR counterparty_key LIKE '%EPOS%')
+ORDER BY id DESC
+LIMIT 1
 """,
-            (payment_date,),
-        ).fetchall()
-        for (child_id,) in child_rows:
-            conn.execute(
-                """
+            (payment_month, int(total_amount)),
+        ).fetchone()
+        if parent is not None:
+            linked_count += link_statement_children(
+                conn, int(parent[0]), "epos_card", "substr(payment_date, 1, 7) = ?", (payment_month,)
+            )
+    return linked_count
+
+
+def link_statement_children(
+    conn: sqlite3.Connection, parent_id: int, source_type: str, payment_condition: str, payment_params: tuple[Any, ...]
+) -> int:
+    child_rows = conn.execute(
+        f"SELECT id FROM transactions t WHERE source_type = ? AND {payment_condition} "
+        "AND NOT EXISTS (SELECT 1 FROM transaction_links x WHERE x.link_type = 'cancellation' "
+        "AND (x.parent_transaction_id = t.id OR x.child_transaction_id = t.id)) ORDER BY transaction_date, id",
+        (source_type, *payment_params),
+    ).fetchall()
+    for (child_id,) in child_rows:
+        conn.execute(
+            """
 INSERT OR IGNORE INTO transaction_links(parent_transaction_id, child_transaction_id, link_type, created_at)
 VALUES(?, ?, 'card_statement', ?)
 """,
-                (int(parent[0]), int(child_id), now_utc()),
-            )
-            linked_count += 1
-    return linked_count
+            (parent_id, int(child_id), now_utc()),
+        )
+    return len(child_rows)
 
 
 def import_file(db_path: Path, csv_path: Path, allowed_sources: set[str] | None = None) -> dict[str, Any]:
@@ -401,6 +521,7 @@ INSERT INTO transactions(
                 inherit_tags(conn, source_tx_id, tx_id)
             inserted_count += 1
 
+        reconcile_cancellation_links(conn)
         linked_count = reconcile_card_statement_links(conn)
         finish_import(conn, import_id, source_type, "success", inserted_count, duplicate_count)
         conn.commit()

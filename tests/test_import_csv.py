@@ -246,6 +246,107 @@ WHERE t.amount = 950
             conn.close()
             self.assertEqual(count, 0)
 
+    def test_epos_cp932_import_skips_metadata_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "epos.csv"
+            db_path = root / "housekeeper.sqlite"
+            self.write_epos_csv(csv_path, [
+                ["ショッピング", "2026年1月1日", "STORE A", "－", "100", "1回払い", "2026年2月", ""],
+                ["ショッピング", "2026年1月2日", "STORE B", "－", "200", "1回払い", "2026年2月", ""],
+                ["ショッピング合計", "", "", "", "300", "", "", ""],
+            ])
+
+            first = import_file(db_path, csv_path)
+            second = import_file(db_path, csv_path)
+
+            self.assertEqual(first["source_type"], "epos_card")
+            self.assertEqual(first["inserted_count"], 2)
+            self.assertEqual(second["duplicate_count"], 2)
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                "SELECT transaction_date, description, amount, payment_date FROM transactions ORDER BY id"
+            ).fetchall()
+            conn.close()
+            self.assertEqual(rows, [
+                ("2026-01-01", "STORE A", 100, "2026-02-01"),
+                ("2026-01-02", "STORE B", 200, "2026-02-01"),
+            ])
+
+    def test_epos_links_to_mufg_card_payment_by_payment_month(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "housekeeper.sqlite"
+            epos_csv = root / "epos.csv"
+            mufg_csv = root / "mufg.csv"
+            self.write_epos_csv(epos_csv, [
+                ["ショッピング", "2026年5月1日", "STORE A", "－", "100", "1回払い", "2026年6月", ""],
+                ["ショッピング", "2026年5月2日", "STORE B", "－", "200", "1回払い", "2026年6月", ""],
+                ["ショッピング", "2026年5月3日", "STORE REFUND", "－", "-50", "1回払い", "2026年6月", ""],
+            ])
+            self.write_csv(
+                mufg_csv, self.mufg_header(), [["2026/6/27", "口座振替4", "エポスカ-ド", "250", "", "1000"]], "cp932"
+            )
+
+            import_file(db_path, epos_csv)
+            result = import_file(db_path, mufg_csv)
+
+            conn = sqlite3.connect(db_path)
+            links = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT child_transaction_id) FROM transaction_links WHERE link_type = 'card_statement'"
+            ).fetchone()
+            conn.close()
+            self.assertEqual(result["linked_count"], 3)
+            self.assertEqual(links, (3, 3))
+
+    def test_exact_epos_expense_and_refund_are_canceled_and_not_linked_to_statement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "housekeeper.sqlite"
+            epos_csv = root / "epos.csv"
+            mufg_csv = root / "mufg.csv"
+            self.write_epos_csv(epos_csv, [
+                ["ショッピング", "2026年4月17日", "CANCELED STORE", "－", "28526", "1回払い", "2026年5月", ""],
+                ["ショッピング", "2026年4月17日", "CANCELED STORE", "－", "-28526", "1回払い", "2026年5月", "お取消日 2026年4月24日"],
+                ["ショッピング", "2026年4月18日", "REAL STORE", "－", "300", "1回払い", "2026年5月", ""],
+            ])
+            self.write_csv(
+                mufg_csv, self.mufg_header(), [["2026/5/27", "口座振替4", "エポスカ-ド", "300", "", "1000"]], "cp932"
+            )
+
+            import_file(db_path, epos_csv)
+            import_file(db_path, mufg_csv)
+
+            conn = sqlite3.connect(db_path)
+            cancellation = conn.execute("SELECT COUNT(*) FROM transaction_links WHERE link_type = 'cancellation'").fetchone()[0]
+            statement_children = conn.execute(
+                "SELECT c.description FROM transaction_links l JOIN transactions c ON c.id = l.child_transaction_id WHERE l.link_type = 'card_statement'"
+            ).fetchall()
+            conn.close()
+            self.assertEqual(cancellation, 1)
+            self.assertEqual(statement_children, [("REAL STORE",)])
+
+    @staticmethod
+    def epos_header() -> list[str]:
+        return [
+            "種別（ショッピング、キャッシング、その他）",
+            "ご利用年月日",
+            "ご利用場所",
+            "ご利用内容",
+            "ご利用金額（キャッシングでは元金になります）",
+            "支払区分",
+            "お支払開始月",
+            "備考",
+        ]
+
+    @classmethod
+    def write_epos_csv(cls, path: Path, rows: list[list[str]]) -> None:
+        with path.open("w", newline="", encoding="cp932") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["月別ご利用明細", "", "", "", "", "", "", ""])
+            writer.writerow(cls.epos_header())
+            writer.writerows(rows)
+
     @staticmethod
     def paypay_header() -> list[str]:
         return [

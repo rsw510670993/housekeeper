@@ -227,9 +227,24 @@ function handle_tag_action(string $action): array
     return ['ok' => true, 'message' => 'Tag 已更新。'];
 }
 
+function tag_color_palette(): array
+{
+    return [
+        '#ef4444', '#dc2626', '#f87171', '#ff3232',
+        '#f97316', '#ea580c', '#fb923c', '#f59e0b',
+        '#eab308', '#facc15', '#fde047', '#ca8a04',
+        '#22c55e', '#16a34a', '#4ade80', '#84cc16',
+        '#8dee17', '#06b6d4', '#0891b2', '#22d3ee',
+        '#14b8a6', '#3b82f6', '#2563eb', '#60a5fa',
+        '#0ea5e9', '#8b5cf6', '#7c3aed', '#a78bfa',
+        '#d946ef', '#64748b', '#adadad', '#111827',
+    ];
+}
+
 function normalize_tag_color(string $color): string
 {
-    return preg_match('/^#[0-9a-fA-F]{6}$/', $color) === 1 ? strtolower($color) : '#3b82f6';
+    $color = strtolower(trim($color));
+    return in_array($color, tag_color_palette(), true) ? $color : '#3b82f6';
 }
 
 function save_settings(array $config): void
@@ -239,6 +254,7 @@ function save_settings(array $config): void
     $config['upload_dir'] = trim((string) ($_POST['upload_dir'] ?? DEFAULT_UPLOAD_DIR)) ?: DEFAULT_UPLOAD_DIR;
     $config['python_command'] = trim((string) ($_POST['python_command'] ?? 'python')) ?: 'python';
     $config['sources']['paypay_card'] = isset($_POST['source_paypay_card']);
+    $config['sources']['epos_card'] = isset($_POST['source_epos_card']);
     $config['sources']['mufg_bank'] = isset($_POST['source_mufg_bank']);
 
     $newPassword = (string) ($_POST['new_password'] ?? '');
@@ -277,6 +293,13 @@ function render_page(string $page, array $config): void
         .action-cell { width: 1%; white-space: nowrap; }
         .tag-list { max-width: 18rem; }
         .tag-list .badge { font-weight: 500; }
+        .tag-color-menu { min-width: auto; width: 12.5rem; }
+        .tag-color-grid { display: grid; grid-template-columns: repeat(4, 2.25rem); gap: .5rem; }
+        .tag-color-option { width: 2.25rem; height: 2.25rem; border: 2px solid transparent; border-radius: .25rem; }
+        .tag-color-option:hover, .tag-color-option:focus { border-color: #212529; transform: scale(1.06); }
+        .tag-color-option.is-selected { border-color: #212529; box-shadow: 0 0 0 2px #fff inset; }
+        .tag-color-trigger { width: 3rem; height: 2.4rem; padding: .3rem; }
+        .tag-color-swatch { display: block; width: 100%; height: 100%; border-radius: .2rem; border: 1px solid rgba(0,0,0,.15); }
     </style>
 </head>
 <body>
@@ -473,6 +496,8 @@ document.addEventListener('DOMContentLoaded', () => {
     transactionForm?.addEventListener('submit', async (event) => {
         event.preventDefault();
         const feedback = document.getElementById('tagModalFeedback');
+        const submitButton = transactionForm.querySelector('[type="submit"]');
+        if (submitButton) submitButton.disabled = true;
         try {
             addSelectedTransactionTag(currentTagFragment());
             tagInput.value = '';
@@ -481,9 +506,28 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.querySelectorAll(`[data-tag-display="${id}"]`).forEach(node => renderTagNames(node, names));
                 document.querySelectorAll(`[data-transaction-id="${id}"]`).forEach(button => button.setAttribute('data-tags', names));
             });
-            feedback.className = 'small mt-3 text-success'; feedback.textContent = data.message;
             bootstrap.Modal.getOrCreateInstance(document.getElementById('tagModal')).hide();
-        } catch (error) { feedback.className = 'small mt-3 text-danger'; feedback.textContent = error.message; }
+            showPageFeedback(data.message, true);
+        } catch (error) {
+            if (feedback) { feedback.className = 'alert alert-danger py-2 mt-3 mb-0'; feedback.textContent = error.message; }
+        } finally {
+            if (submitButton) submitButton.disabled = false;
+        }
+    });
+
+    function setTagColorPicker(picker, color) {
+        const input = picker.querySelector('input[name="color"]');
+        const swatch = picker.querySelector('.tag-color-swatch');
+        if (!input || !swatch) return;
+        input.value = color;
+        swatch.style.backgroundColor = color;
+        picker.querySelectorAll('.tag-color-option').forEach(option => option.classList.toggle('is-selected', option.dataset.color === color));
+    }
+
+    document.addEventListener('click', event => {
+        const option = event.target.closest('.tag-color-option');
+        if (!option) return;
+        setTagColorPicker(option.closest('.tag-color-picker'), option.dataset.color);
     });
 
     document.addEventListener('submit', async (event) => {
@@ -492,7 +536,11 @@ document.addEventListener('DOMContentLoaded', () => {
         event.preventDefault();
         try {
             const data = await postAjax(new FormData(form));
-            if (data.row_html) { document.getElementById('tagRows').insertAdjacentHTML('beforeend', data.row_html); form.reset(); form.querySelector('[type="color"]').value = '#3b82f6'; }
+            if (data.row_html) {
+                document.getElementById('tagRows').insertAdjacentHTML('beforeend', data.row_html);
+                form.reset();
+                form.querySelectorAll('.tag-color-picker').forEach(picker => setTagColorPicker(picker, picker.querySelector('input[name="color"]').value));
+            }
             showPageFeedback(data.message, true);
         } catch (error) { showPageFeedback(error.message, false); }
     });
@@ -505,7 +553,33 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     if (window.tagExpenseChartData && document.getElementById('tagExpenseChart')) {
-        new Chart(document.getElementById('tagExpenseChart'), {type: 'doughnut', data: {labels: window.tagExpenseChartData.labels, datasets: [{data: window.tagExpenseChartData.values, backgroundColor: window.tagExpenseChartData.colors, borderWidth: 2, borderColor: '#fff'}]}, options: {responsive: true, maintainAspectRatio: false, cutout: '58%', plugins: {legend: {position: 'bottom'}, tooltip: {callbacks: {label: context => `${context.label}: ${Math.round(context.raw).toLocaleString()} (${context.dataset.data.reduce((a,b)=>a+b,0) ? (context.raw / context.dataset.data.reduce((a,b)=>a+b,0) * 100).toFixed(1) : 0}%)`}}}}});
+        const source = window.tagExpenseChartData;
+        const filters = [...document.querySelectorAll('[data-tag-chart-filter]')];
+        const chart = new Chart(document.getElementById('tagExpenseChart'), {
+            type: 'doughnut',
+            data: {labels: [], datasets: [{data: [], backgroundColor: [], borderWidth: 2, borderColor: '#fff'}]},
+            options: {responsive: true, maintainAspectRatio: false, cutout: '58%', plugins: {legend: {display: false}, tooltip: {callbacks: {label: context => { const total = context.dataset.data.reduce((a, b) => a + b, 0); return `${context.label}: ${Math.round(context.raw).toLocaleString()} (${total ? (context.raw / total * 100).toFixed(1) : 0}%)`; }}}}}
+        });
+
+        function updateTagExpenseChart() {
+            const selected = filters.filter(filter => filter.checked).map(filter => Number(filter.dataset.tagChartFilter));
+            const total = selected.reduce((sum, index) => sum + Number(source.values[index] || 0), 0);
+            chart.data.labels = selected.map(index => source.labels[index]);
+            chart.data.datasets[0].data = selected.map(index => source.values[index]);
+            chart.data.datasets[0].backgroundColor = selected.map(index => source.colors[index]);
+            chart.update();
+            document.getElementById('tagExpenseTotal').textContent = Math.round(total).toLocaleString();
+            document.querySelectorAll('[data-tag-chart-row]').forEach(row => {
+                const index = Number(row.dataset.tagChartRow);
+                const visible = selected.includes(index);
+                row.classList.toggle('d-none', !visible);
+                const percent = row.querySelector('[data-tag-chart-percent]');
+                if (percent) percent.textContent = `${total ? (Number(source.values[index]) / total * 100).toFixed(1) : '0.0'}%`;
+            });
+        }
+
+        filters.forEach(filter => filter.addEventListener('change', updateTagExpenseChart));
+        updateTagExpenseChart();
     }
 });
 </script>
@@ -591,8 +665,20 @@ function render_transactions(): void
     $dateTo = normalize_date_filter((string) ($_GET['date_to'] ?? ''));
     $tag = (string) ($_GET['tag'] ?? '');
     $untagged = (string) ($_GET['untagged'] ?? '') === '1';
+    $direction = (string) ($_GET['direction'] ?? '');
+    $direction = in_array($direction, ['expense', 'income'], true) ? $direction : '';
     $params = [];
-    $where = ["NOT EXISTS (SELECT 1 FROM transaction_links hidden_l WHERE hidden_l.child_transaction_id = t.id AND hidden_l.link_type = 'card_statement')"];
+    $where = [
+        "NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id))",
+    ];
+    if ($tag === '') {
+        $where[] = "t.source_type = 'mufg_bank'";
+    }
+
+    if ($direction !== '') {
+        $where[] = 't.direction = :direction';
+        $params[':direction'] = $direction;
+    }
 
     if ($dateFrom !== '') {
         $where[] = 't.transaction_date >= :date_from';
@@ -628,17 +714,25 @@ function render_transactions(): void
     <div class="card-body">
         <div class="d-flex flex-column flex-lg-row gap-2 justify-content-between align-items-lg-center mb-3">
             <h1 class="h4 mb-0">交易</h1>
-            <span class="text-body-secondary small">已匹配的 PayPay 明细会显示在对应的 MUFG 储蓄卡扣款下。</span>
+            <span class="text-body-secondary small"><?= $tag === '' ? '未选择 Tag 时仅显示 MUFG 顶层交易。' : '已选择 Tag，显示所有来源的匹配交易。' ?></span>
         </div>
         <form method="get" class="row g-3 align-items-end">
             <input type="hidden" name="page" value="transactions">
-            <div class="col-12 col-md-3">
+            <div class="col-12 col-md-2">
                 <label class="form-label">开始日期</label>
                 <input type="date" name="date_from" class="form-control" value="<?= h($dateFrom) ?>">
             </div>
-            <div class="col-12 col-md-3">
+            <div class="col-12 col-md-2">
                 <label class="form-label">结束日期</label>
                 <input type="date" name="date_to" class="form-control" value="<?= h($dateTo) ?>">
+            </div>
+            <div class="col-12 col-md-2">
+                <label class="form-label">收支类型</label>
+                <select name="direction" class="form-select">
+                    <option value="">全部</option>
+                    <option value="expense" <?= $direction === 'expense' ? 'selected' : '' ?>>支出</option>
+                    <option value="income" <?= $direction === 'income' ? 'selected' : '' ?>>收入</option>
+                </select>
             </div>
             <div class="col-12 col-md-2">
                 <label class="form-label">Tag</label>
@@ -676,7 +770,7 @@ function render_transactions(): void
                         <div class="fw-medium"><?= render_description($row) ?></div>
                         <?php if ((int) $row['child_count'] > 0): ?>
                             <button class="btn btn-link btn-sm p-0 mt-1" type="button" data-bs-toggle="collapse" data-bs-target="#<?= h($collapseId) ?>" aria-expanded="false" aria-controls="<?= h($collapseId) ?>">
-                                <?= h((string) $row['child_count']) ?> PayPay 明细，合计 <?= h(number_format((int) $row['child_total'])) ?>
+                                <?= h((string) $row['child_count']) ?> 信用卡明细，合计 <?= h(number_format((int) $row['child_total'])) ?>
                             </button>
                         <?php endif; ?>
                     </td>
@@ -717,6 +811,7 @@ function render_transactions(): void
     </div>
 </div>
 <?= render_tag_modal($tags) ?>
+<div id="tagPageFeedback" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 <?php
 }
 
@@ -734,7 +829,7 @@ function load_children_by_parent(array $parentIds): array
         return [];
     }
     $placeholders = implode(',', array_fill(0, count($parentIds), '?'));
-    $stmt = db()->prepare("\n        SELECT l.parent_transaction_id, c.*,\n               COALESCE((SELECT GROUP_CONCAT(g.name, ', ') FROM transaction_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.transaction_id = c.id), '') AS tag_names\n        FROM transaction_links l\n        JOIN transactions c ON c.id = l.child_transaction_id\n        WHERE l.link_type = 'card_statement' AND l.parent_transaction_id IN ($placeholders)\n        ORDER BY c.transaction_date, c.id\n    ");
+    $stmt = db()->prepare("\n        SELECT l.parent_transaction_id, c.*,\n               COALESCE((SELECT GROUP_CONCAT(g.name, ', ') FROM transaction_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.transaction_id = c.id), '') AS tag_names\n        FROM transaction_links l\n        JOIN transactions c ON c.id = l.child_transaction_id\n        WHERE l.link_type = 'card_statement' AND l.parent_transaction_id IN ($placeholders)\n          AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = c.id OR cancel_l.child_transaction_id = c.id))\n        ORDER BY c.transaction_date, c.id\n    ");
     $stmt->execute($parentIds);
     $children = [];
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
@@ -802,6 +897,7 @@ function render_tag_modal(array $tagNames): string
                     <input class="form-check-input" type="checkbox" value="1" id="batchSameName" name="batch_same_name">
                     <label class="form-check-label" for="batchSameName">同时替换完全同名交易的标签</label>
                 </div>
+                <div id="tagModalFeedback"></div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
@@ -832,6 +928,7 @@ function source_label(string $source): string
 {
     return match ($source) {
         'paypay_card' => 'PayPay 信用卡',
+        'epos_card' => 'EPOS 信用卡',
         'mufg_bank' => 'MUFG 储蓄卡',
         default => $source,
     };
@@ -860,7 +957,7 @@ function render_tags_page(): void
                     <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
                     <input type="hidden" name="action" value="create_tag">
                     <div class="mb-3"><label class="form-label">名称</label><input name="name" class="form-control" required></div>
-                    <div class="mb-3"><label class="form-label">颜色</label><input name="color" type="color" class="form-control form-control-color" value="#3b82f6"></div>
+                    <div class="mb-3"><label class="form-label">颜色</label><?= render_tag_color_picker('#3b82f6') ?></div>
                     <button class="btn btn-primary" type="submit"><i class="bi bi-plus-lg me-1"></i>新增</button>
                 </form>
             </div>
@@ -883,15 +980,39 @@ function render_tags_page(): void
 <?php
 }
 
+function render_tag_color_picker(string $color, ?string $formId = null): string
+{
+    $color = normalize_tag_color($color);
+    $formAttribute = $formId !== null ? ' form="' . h($formId) . '"' : '';
+    ob_start();
+    ?>
+<div class="dropdown tag-color-picker">
+    <input type="hidden" name="color" value="<?= h($color) ?>"<?= $formAttribute ?>>
+    <button class="btn btn-outline-secondary dropdown-toggle tag-color-trigger" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="选择颜色">
+        <span class="tag-color-swatch" style="background-color:<?= h($color) ?>"></span>
+    </button>
+    <div class="dropdown-menu tag-color-menu p-3">
+        <div class="tag-color-grid">
+            <?php foreach (tag_color_palette() as $option): ?>
+            <button type="button" class="tag-color-option<?= $option === $color ? ' is-selected' : '' ?>" style="background-color:<?= h($option) ?>" data-color="<?= h($option) ?>" title="<?= h($option) ?>" aria-label="选择颜色 <?= h($option) ?>"></button>
+            <?php endforeach; ?>
+        </div>
+    </div>
+</div>
+    <?php
+    return (string) ob_get_clean();
+}
+
 function render_tag_management_row(array $tag): string
 {
+    $formId = 'tag-form-' . (string) $tag['id'];
     ob_start(); ?>
 <tr data-tag-row="<?= h((string) $tag['id']) ?>">
-    <td><input form="tag-form-<?= h((string) $tag['id']) ?>" name="color" type="color" class="form-control form-control-color" value="<?= h((string) $tag['color']) ?>"></td>
-    <td><input form="tag-form-<?= h((string) $tag['id']) ?>" name="name" class="form-control" value="<?= h((string) $tag['name']) ?>" required></td>
+    <td><?= render_tag_color_picker((string) $tag['color'], $formId) ?></td>
+    <td><input form="<?= h($formId) ?>" name="name" class="form-control" value="<?= h((string) $tag['name']) ?>" required></td>
     <td><span class="badge text-bg-light border"><?= h((string) $tag['usage_count']) ?></span></td>
     <td class="text-end">
-        <form id="tag-form-<?= h((string) $tag['id']) ?>" class="ajax-tag-form d-inline" data-action="update_tag">
+        <form id="<?= h($formId) ?>" class="ajax-tag-form d-inline" data-action="update_tag">
             <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>"><input type="hidden" name="action" value="update_tag"><input type="hidden" name="tag_id" value="<?= h((string) $tag['id']) ?>">
             <button class="btn btn-outline-primary btn-sm" type="submit">保存</button>
             <button class="btn btn-outline-danger btn-sm tag-delete-button" type="button" data-tag-id="<?= h((string) $tag['id']) ?>">删除</button>
@@ -900,6 +1021,7 @@ function render_tag_management_row(array $tag): string
 </tr>
 <?php return (string) ob_get_clean();
 }
+
 
 function render_charts_page(): void
 {
@@ -911,11 +1033,12 @@ function render_charts_page(): void
     $year = preg_match('/^\\d{4}$/', (string) ($_GET['year'] ?? '')) ? (string) $_GET['year'] : substr($latestDate, 0, 4);
     $period = $scope === 'year' ? $year : $month;
     $rows = expense_tag_statistics($period, $scope);
-    $total = array_sum(array_column($rows, 'amount'));
+    $defaultVisibleRows = array_values(array_filter($rows, static fn(array $row): bool => (string) $row['name'] !== '提现'));
+    $defaultVisibleTotal = array_sum(array_column($defaultVisibleRows, 'amount'));
     ?>
 <div class="card shadow-sm border-0 mb-4"><div class="card-body">
     <div class="d-flex flex-column flex-lg-row justify-content-between gap-3 align-items-lg-end">
-        <div><h1 class="h4 mb-1">Tag 支出比例</h1><div class="text-body-secondary small">多 Tag 交易按 Tag 数量平均分摊；PayPay 总扣款不重复计算。</div></div>
+        <div><h1 class="h4 mb-1">Tag 支出比例</h1><div class="text-body-secondary small">信用卡明细按付款月份统计；多 Tag 交易平均分摊；信用卡总扣款不重复计算。</div></div>
         <form method="get" class="d-flex flex-wrap gap-2 align-items-end"><input type="hidden" name="page" value="charts">
             <div><label class="form-label small">统计范围</label><select name="scope" class="form-select"><option value="month" <?= $scope === 'month' ? 'selected' : '' ?>>月份</option><option value="year" <?= $scope === 'year' ? 'selected' : '' ?>>全年</option></select></div>
             <div><label class="form-label small">月份</label><input type="month" name="month" class="form-control" value="<?= h($month) ?>"></div>
@@ -924,8 +1047,19 @@ function render_charts_page(): void
         </form>
     </div>
 </div></div>
+<div class="card shadow-sm border-0 mb-4"><div class="card-body py-3">
+    <div class="d-flex flex-wrap gap-3 align-items-center" id="tagExpenseFilters">
+        <span class="small fw-semibold text-body-secondary">显示分类</span>
+        <?php foreach ($rows as $index => $row): ?>
+        <div class="form-check form-check-inline m-0">
+            <input class="form-check-input" type="checkbox" id="tag-filter-<?= h((string) $index) ?>" data-tag-chart-filter="<?= h((string) $index) ?>" <?= (string) $row['name'] !== '提现' ? 'checked' : '' ?>>
+            <label class="form-check-label d-inline-flex align-items-center gap-1" for="tag-filter-<?= h((string) $index) ?>"><span class="rounded-1 d-inline-block" style="width:10px;height:10px;background:<?= h($row['color']) ?>"></span><?= h($row['name']) ?></label>
+        </div>
+        <?php endforeach; ?>
+    </div>
+</div></div>
 <div class="row g-4"><div class="col-12 col-xl-7"><div class="card shadow-sm border-0"><div class="card-body"><div style="height:420px"><canvas id="tagExpenseChart"></canvas></div></div></div></div>
-<div class="col-12 col-xl-5"><div class="card shadow-sm border-0"><div class="card-body border-bottom"><div class="text-body-secondary small"><?= h($period) ?> 总支出</div><div class="fs-3 fw-semibold"><?= number_format((int) round($total)) ?></div></div><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Tag</th><th class="text-end">金额</th><th class="text-end">占比</th></tr></thead><tbody><?php foreach ($rows as $row): ?><tr><td><span class="badge me-2" style="background:<?= h($row['color']) ?>">&nbsp;</span><?= h($row['name']) ?></td><td class="text-end"><?= number_format((int) round($row['amount'])) ?></td><td class="text-end"><?= $total > 0 ? number_format($row['amount'] / $total * 100, 1) : '0.0' ?>%</td></tr><?php endforeach; ?></tbody></table></div></div></div></div>
+<div class="col-12 col-xl-5"><div class="card shadow-sm border-0"><div class="card-body border-bottom"><div class="text-body-secondary small"><?= h($period) ?> 总支出</div><div class="fs-3 fw-semibold" id="tagExpenseTotal"><?= number_format((int) round($defaultVisibleTotal)) ?></div></div><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Tag</th><th class="text-end">金额</th><th class="text-end">占比</th></tr></thead><tbody><?php foreach ($rows as $index => $row): ?><tr data-tag-chart-row="<?= h((string) $index) ?>" <?= (string) $row['name'] === '提现' ? 'class="d-none"' : '' ?>><td><span class="badge me-2" style="background:<?= h($row['color']) ?>">&nbsp;</span><?= h($row['name']) ?></td><td class="text-end"><?= number_format((int) round($row['amount'])) ?></td><td class="text-end" data-tag-chart-percent><?= $defaultVisibleTotal > 0 ? number_format($row['amount'] / $defaultVisibleTotal * 100, 1) : '0.0' ?>%</td></tr><?php endforeach; ?></tbody></table></div></div></div></div>
 <script>window.tagExpenseChartData = <?= json_encode(['labels' => array_column($rows, 'name'), 'values' => array_column($rows, 'amount'), 'colors' => array_column($rows, 'color')], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
 <?php
 }
@@ -933,8 +1067,9 @@ function render_charts_page(): void
 function expense_tag_statistics(string $period, string $scope): array
 {
     $pdo = db();
-    $dateCondition = $scope === 'year' ? "substr(t.transaction_date, 1, 4) = :period" : "substr(t.transaction_date, 1, 7) = :period";
-    $stmt = $pdo->prepare("SELECT t.id, t.amount, g.name, g.color FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.direction = 'expense' AND $dateCondition AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement') ORDER BY t.id");
+    $effectiveDate = "CASE WHEN t.source_type IN ('paypay_card', 'epos_card') AND t.payment_date IS NOT NULL THEN t.payment_date ELSE t.transaction_date END";
+    $dateCondition = $scope === 'year' ? "substr($effectiveDate, 1, 4) = :period" : "substr($effectiveDate, 1, 7) = :period";
+    $stmt = $pdo->prepare("SELECT t.id, t.amount, g.name, g.color FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.direction = 'expense' AND $dateCondition AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement') AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id)) ORDER BY t.id");
     $stmt->execute([':period' => $period]);
     $transactions = [];
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
@@ -987,6 +1122,10 @@ function render_settings(array $config): void
                 <div class="form-check form-check-inline">
                     <input class="form-check-input" id="source_paypay_card" type="checkbox" name="source_paypay_card" <?= !empty($config['sources']['paypay_card']) ? 'checked' : '' ?>>
                     <label class="form-check-label" for="source_paypay_card">PayPay 信用卡</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input" id="source_epos_card" type="checkbox" name="source_epos_card" <?= !empty($config['sources']['epos_card']) ? 'checked' : '' ?>>
+                    <label class="form-check-label" for="source_epos_card">EPOS 信用卡</label>
                 </div>
                 <div class="form-check form-check-inline">
                     <input class="form-check-input" id="source_mufg_bank" type="checkbox" name="source_mufg_bank" <?= !empty($config['sources']['mufg_bank']) ? 'checked' : '' ?>>
