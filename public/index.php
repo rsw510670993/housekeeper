@@ -392,6 +392,8 @@ function render_page(string $page, array $config): void
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <style>
         body { background: #f6f7f9; }
+        .app-shell { width: min(100%, 1440px); margin-inline: auto; }
+        @media (min-width: 992px) { .app-shell { padding-inline: 1.5rem !important; } }
         .amount-expense { color: #b42318; font-variant-numeric: tabular-nums; }
         .amount-income { color: #067647; font-variant-numeric: tabular-nums; }
         .table td, .table th { vertical-align: middle; }
@@ -430,7 +432,7 @@ function render_page(string $page, array $config): void
 <body>
 <?php if ($page !== 'login'): ?>
 <nav class="navbar navbar-expand-lg bg-white border-bottom sticky-top">
-    <div class="container-fluid px-3 px-lg-4">
+    <div class="container-fluid app-shell px-3 px-lg-4">
         <a class="navbar-brand fw-semibold" href="?page=charts">Housekeeper</a>
         <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav" aria-controls="mainNav" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -453,7 +455,7 @@ function render_page(string $page, array $config): void
     </div>
 </nav>
 <?php endif; ?>
-<main class="container-fluid px-3 px-lg-4 py-4">
+<main class="container-fluid app-shell px-3 px-lg-4 py-4">
 <?php if ($flash): ?><div class="alert alert-info shadow-sm"><?= h($flash) ?></div><?php endif; ?>
 <?php
     if ($page === 'login') {
@@ -847,7 +849,6 @@ function render_login(): void
                         <input id="password" name="password" type="password" class="form-control" required autofocus>
                     </div>
                     <button type="submit" class="btn btn-primary w-100">登录</button>
-                    <p class="text-body-secondary small mt-3 mb-0">首次默认密码：admin123</p>
                 </form>
             </div>
         </div>
@@ -912,17 +913,18 @@ function render_upload(): void
 
 function render_transactions(): void
 {
-    $dateFrom = normalize_date_filter((string) ($_GET['date_from'] ?? ''));
-    $dateTo = normalize_date_filter((string) ($_GET['date_to'] ?? ''));
+    $month = preg_match('/^\d{4}-\d{2}$/', (string) ($_GET['month'] ?? '')) ? (string) $_GET['month'] : '';
+    $category = trim((string) ($_GET['category'] ?? ''));
     $tag = (string) ($_GET['tag'] ?? '');
     $untagged = (string) ($_GET['untagged'] ?? '') === '1';
     $direction = (string) ($_GET['direction'] ?? '');
     $direction = in_array($direction, ['expense', 'income'], true) ? $direction : '';
+    $effectiveDate = "CASE WHEN t.source_type IN ('paypay_card', 'epos_card') AND t.payment_date IS NOT NULL THEN t.payment_date ELSE t.transaction_date END";
     $params = [];
     $where = [
         "NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id))",
     ];
-    if ($tag === '') {
+    if ($tag === '' && $category === '') {
         $where[] = "t.source_type = 'mufg_bank'";
     }
 
@@ -931,13 +933,14 @@ function render_transactions(): void
         $params[':direction'] = $direction;
     }
 
-    if ($dateFrom !== '') {
-        $where[] = 't.transaction_date >= :date_from';
-        $params[':date_from'] = $dateFrom;
+    if ($month !== '') {
+        $where[] = "substr($effectiveDate, 1, 7) = :month";
+        $params[':month'] = $month;
     }
-    if ($dateTo !== '') {
-        $where[] = 't.transaction_date <= :date_to';
-        $params[':date_to'] = $dateTo;
+
+    if ($category !== '') {
+        $where[] = "EXISTS (SELECT 1 FROM transaction_tags tt_category JOIN tags g_category ON g_category.id = tt_category.tag_id WHERE tt_category.transaction_id = t.id AND COALESCE(NULLIF(g_category.parent_name, ''), g_category.name) = :category)";
+        $params[':category'] = $category;
     }
     if ($tag !== '') {
         $where[] = 'EXISTS (SELECT 1 FROM transaction_tags tt_filter JOIN tags g_filter ON g_filter.id = tt_filter.tag_id WHERE tt_filter.transaction_id = t.id AND g_filter.name = :tag)';
@@ -955,27 +958,26 @@ function render_transactions(): void
             WHERE ' . implode(' AND ', $where) . '
             ORDER BY t.transaction_date DESC, t.id DESC LIMIT 300';
 
-    $stmt = db()->prepare($sql);
+    $pdo = db();
+    $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $childrenByParent = load_children_by_parent(array_map(static fn(array $row): int => (int) $row['id'], $rows));
-    $tags = available_tag_names(db());
+    $tags = available_tag_names($pdo);
+    $categories = $pdo->query("SELECT DISTINCT COALESCE(NULLIF(parent_name, ''), name) AS category_name FROM tags ORDER BY category_name")->fetchAll(PDO::FETCH_COLUMN);
+    $filterSummary = ($tag === '' && $category === '') ? '未选择 Tag 或大类时仅显示 MUFG 顶层交易。' : '已选择 Tag 或大类，显示所有来源的匹配交易。';
     ?>
 <div class="card shadow-sm mb-4">
     <div class="card-body">
         <div class="d-flex flex-column flex-lg-row gap-2 justify-content-between align-items-lg-center mb-3">
             <h1 class="h4 mb-0">交易</h1>
-            <span class="text-body-secondary small"><?= $tag === '' ? '未选择 Tag 时仅显示 MUFG 顶层交易。' : '已选择 Tag，显示所有来源的匹配交易。' ?></span>
+            <span class="text-body-secondary small"><?= h($filterSummary) ?></span>
         </div>
         <form method="get" class="row g-3 align-items-end">
             <input type="hidden" name="page" value="transactions">
             <div class="col-12 col-md-2">
-                <label class="form-label">开始日期</label>
-                <input type="date" name="date_from" class="form-control" value="<?= h($dateFrom) ?>">
-            </div>
-            <div class="col-12 col-md-2">
-                <label class="form-label">结束日期</label>
-                <input type="date" name="date_to" class="form-control" value="<?= h($dateTo) ?>">
+                <label class="form-label">归属月份</label>
+                <input type="month" name="month" class="form-control" value="<?= h($month) ?>">
             </div>
             <div class="col-12 col-md-2">
                 <label class="form-label">收支类型</label>
@@ -983,6 +985,13 @@ function render_transactions(): void
                     <option value="">全部</option>
                     <option value="expense" <?= $direction === 'expense' ? 'selected' : '' ?>>支出</option>
                     <option value="income" <?= $direction === 'income' ? 'selected' : '' ?>>收入</option>
+                </select>
+            </div>
+            <div class="col-12 col-md-2">
+                <label class="form-label">大类</label>
+                <select name="category" class="form-select">
+                    <option value="">全部</option>
+                    <?php foreach ($categories as $categoryName): ?><option value="<?= h((string) $categoryName) ?>" <?= $category === (string) $categoryName ? 'selected' : '' ?>><?= h((string) $categoryName) ?></option><?php endforeach; ?>
                 </select>
             </div>
             <div class="col-12 col-md-2">
@@ -1423,7 +1432,49 @@ function render_charts_page(): void
                 <div class="col"><div class="text-body-secondary small"><?= h($month) ?> 当月总支出</div><div class="fs-3 fw-semibold" id="tagExpenseTotal"><?= number_format((int) round($defaultVisibleTotal)) ?></div></div>
                 <div class="col"><div class="text-body-secondary small"><?= h($previousMonth) ?> 上月总支出</div><div class="fs-3 fw-semibold text-body-secondary" id="tagExpensePreviousTotal"><?= number_format((int) round($defaultVisiblePreviousTotal)) ?></div></div>
             </div>
-        </div><div class="table-responsive"><table class="table mb-0 align-middle"><thead class="table-light"><tr><th style="width:3rem">显示</th><th>大类</th><th class="text-end"><?= h($previousMonth) ?></th><th class="text-end"><?= h($month) ?></th><th class="text-end">增减</th><th class="text-end">增减率</th></tr></thead><tbody><?php foreach ($rows as $index => $row): ?><tr data-tag-chart-row="<?= h((string) $index) ?>" <?= (string) $row['category_name'] === '提现' ? 'class="table-light text-body-secondary"' : '' ?>><td><input class="form-check-input" type="checkbox" aria-label="显示 <?= h($row['category_name']) ?>" data-tag-chart-filter="<?= h((string) $index) ?>" <?= (string) $row['category_name'] !== '提现' ? 'checked' : '' ?>></td><td><?= h($row['category_name']) ?></td><td class="text-end"><?= number_format((int) round($row['previous_amount'])) ?></td><td class="text-end"><?= number_format((int) round($row['current_amount'])) ?></td><td class="text-end <?= $row['delta'] > 0 ? 'amount-expense' : ($row['delta'] < 0 ? 'amount-income' : '') ?>"><?= $row['delta'] > 0 ? '+' : '' ?><?= number_format((int) round($row['delta'])) ?></td><td class="text-end"><?= $row['delta_rate'] === null ? '-' : (($row['delta_rate'] > 0 ? '+' : '') . number_format($row['delta_rate'], 1) . '%') ?></td></tr><?php endforeach; ?><?php if (!$rows): ?><tr><td colspan="6" class="text-center text-body-secondary py-4">没有可对比的支出数据。</td></tr><?php endif; ?></tbody></table></div></div></div></div>
+        </div>
+        <div class="card-body pt-3">
+            <div class="table-responsive">
+                <table class="table table-sm mb-0 align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width:3rem">显示</th>
+                            <th>大类</th>
+                            <th class="text-end"><?= h($previousMonth) ?></th>
+                            <th class="text-end"><?= h($month) ?></th>
+                            <th class="text-end">增减</th>
+                            <th class="text-end">增减率</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($rows as $index => $row): ?>
+                            <?php
+                                $categoryName = (string) $row['category_name'];
+                                $previousAmount = (int) round($row['previous_amount']);
+                                $currentAmount = (int) round($row['current_amount']);
+                                $previousHref = '?' . http_build_query(['page' => 'transactions', 'month' => $previousMonth, 'category' => $categoryName, 'direction' => 'expense']);
+                                $currentHref = '?' . http_build_query(['page' => 'transactions', 'month' => $month, 'category' => $categoryName, 'direction' => 'expense']);
+                                $categoryHref = $currentAmount !== 0 ? $currentHref : $previousHref;
+                            ?>
+                            <tr data-tag-chart-row="<?= h((string) $index) ?>" <?= $categoryName === '提现' ? 'class="table-light text-body-secondary"' : '' ?>>
+                                <td><input class="form-check-input" type="checkbox" aria-label="显示 <?= h($categoryName) ?>" data-tag-chart-filter="<?= h((string) $index) ?>" <?= $categoryName !== '提现' ? 'checked' : '' ?>></td>
+                                <td class="fw-semibold"><a class="link-body-emphasis text-decoration-none" href="<?= h($categoryHref) ?>"><?= h($categoryName) ?></a></td>
+                                <td class="text-end">
+                                    <?php if ($previousAmount !== 0): ?><a class="link-body-emphasis text-decoration-none" href="<?= h($previousHref) ?>"><?= number_format($previousAmount) ?></a><?php else: ?>0<?php endif; ?>
+                                </td>
+                                <td class="text-end">
+                                    <?php if ($currentAmount !== 0): ?><a class="link-body-emphasis text-decoration-none" href="<?= h($currentHref) ?>"><?= number_format($currentAmount) ?></a><?php else: ?>0<?php endif; ?>
+                                </td>
+                                <td class="text-end <?= $row['delta'] > 0 ? 'amount-expense' : ($row['delta'] < 0 ? 'amount-income' : '') ?>"><?= $row['delta'] > 0 ? '+' : '' ?><?= number_format((int) round($row['delta'])) ?></td>
+                                <td class="text-end"><?= $row['delta_rate'] === null ? '-' : (($row['delta_rate'] > 0 ? '+' : '') . number_format($row['delta_rate'], 1) . '%') ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        <?php if (!$rows): ?><tr><td colspan="6" class="text-center text-body-secondary py-4">没有可对比的支出数据。</td></tr><?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div></div>
 </div>
 <script>window.tagExpenseChartData = <?= json_encode(['months' => [$previousMonth, $month], 'labels' => array_column($rows, 'category_name'), 'previousValues' => array_column($rows, 'previous_amount'), 'currentValues' => array_column($rows, 'current_amount'), 'segments' => $segments], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
 <?php
