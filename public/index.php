@@ -32,6 +32,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         redirect('?page=upload');
     }
 
+    if ($action === 'clear_failed_imports') {
+        clear_failed_imports();
+        redirect('?page=upload');
+    }
+
+    if ($action === 'bulk_tag_untagged') {
+        bulk_tag_untagged_expenses();
+        $query = ['page' => 'untagged'];
+        $month = preg_match('/^\d{4}-\d{2}$/', (string) ($_POST['month'] ?? '')) ? (string) $_POST['month'] : '';
+        $source = (string) ($_POST['source'] ?? '');
+        $keyword = trim((string) ($_POST['keyword'] ?? ''));
+        if ($month !== '') $query['month'] = $month;
+        if (in_array($source, ['mufg_bank', 'paypay_card', 'epos_card'], true)) $query['source'] = $source;
+        if ($keyword !== '') $query['keyword'] = $keyword;
+        redirect('?' . http_build_query($query));
+    }
+
     if ($action === 'save_tags') {
         $result = set_transaction_tags((int) $_POST['transaction_id'], (string) ($_POST['tags'] ?? ''), isset($_POST['batch_same_name']));
         if (is_ajax_request()) {
@@ -110,6 +127,49 @@ function handle_upload(array $config): void
     ));
 }
 
+function clear_failed_imports(): void
+{
+    $stmt = db()->prepare("DELETE FROM imports WHERE status = 'failed'");
+    $stmt->execute();
+    flash(sprintf('已清除 %d 条失败导入记录。', $stmt->rowCount()));
+}
+
+function bulk_tag_untagged_expenses(): void
+{
+    $ids = array_values(array_unique(array_filter(array_map('intval', (array) ($_POST['transaction_ids'] ?? [])), static fn(int $id): bool => $id > 0)));
+    $tagName = trim((string) ($_POST['tag_name'] ?? ''));
+    $tagEntry = normalize_tag_entry($tagName);
+    if (!$ids || $tagEntry === null) {
+        flash('请选择交易并输入 Tag。');
+        return;
+    }
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $tagId = find_or_create_tag($pdo, $tagEntry);
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $targetStmt = $pdo->prepare("
+            SELECT t.id FROM transactions t
+            WHERE t.id IN ($placeholders)
+              AND t.direction = 'expense'
+              AND NOT EXISTS (SELECT 1 FROM transaction_tags tt WHERE tt.transaction_id = t.id)
+              AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement')
+              AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id))
+        ");
+        $targetStmt->execute($ids);
+        $targetIds = array_map('intval', $targetStmt->fetchAll(PDO::FETCH_COLUMN));
+        $insert = $pdo->prepare("INSERT OR IGNORE INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, 'manual', :created)");
+        foreach ($targetIds as $id) {
+            $insert->execute([':tx' => $id, ':tag' => $tagId, ':created' => now_utc()]);
+        }
+        $pdo->commit();
+        flash(sprintf('已为 %d 条未标记支出添加 Tag：%s。', count($targetIds), $tagEntry['name']));
+    } catch (Throwable $error) {
+        $pdo->rollBack();
+        flash('批量添加 Tag 失败：' . $error->getMessage());
+    }
+}
+
 function is_ajax_request(): bool
 {
     return strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
@@ -124,12 +184,63 @@ function json_response(array $payload, int $status = 200): never
     exit;
 }
 
+function normalize_tag_entry(string $rawName): ?array
+{
+    $value = trim(str_replace((string) json_decode('"\uFF0F"'), '/', $rawName));
+    if ($value === '') return null;
+    if (str_contains($value, '/')) {
+        [$parentName, $name] = array_map('trim', explode('/', $value, 2));
+        if ($name === '') return null;
+        if ($parentName === '') $parentName = $name;
+        return ['name' => $name, 'parent_name' => $parentName];
+    }
+    return ['name' => $value, 'parent_name' => $value];
+}
+
+function display_tag_name(string $rawName): string
+{
+    $entry = normalize_tag_entry($rawName);
+    return $entry === null ? '' : $entry['name'];
+}
+
+function display_tag_names_from_list(string $tagNames): string
+{
+    $names = [];
+    foreach (explode(',', $tagNames) as $rawName) {
+        $name = display_tag_name($rawName);
+        if ($name !== '') $names[$name] = $name;
+    }
+    return implode(', ', array_values($names));
+}
+
 function parse_tag_names(string $tagText): array
 {
-    return array_values(array_unique(array_filter(array_map(
-        static fn(string $name): string => trim($name),
-        preg_split('/[,\x{FF0C}\s]+/u', $tagText) ?: []
-    ))));
+    $entries = [];
+    foreach (preg_split('/[,\x{FF0C}\s]+/u', $tagText) ?: [] as $rawName) {
+        $entry = normalize_tag_entry((string) $rawName);
+        if ($entry !== null) $entries[$entry['name']] = $entry;
+    }
+    return array_values($entries);
+}
+
+function available_tag_names(PDO $pdo): array
+{
+    $names = [];
+    foreach ($pdo->query('SELECT name FROM tags ORDER BY name')->fetchAll(PDO::FETCH_COLUMN) as $rawName) {
+        $name = display_tag_name((string) $rawName);
+        if ($name !== '') $names[$name] = $name;
+    }
+    natcasesort($names);
+    return array_values($names);
+}
+
+function find_or_create_tag(PDO $pdo, array $tagEntry, string $defaultColor = '#3b82f6'): int
+{
+    $stmt = $pdo->prepare('INSERT OR IGNORE INTO tags(name, parent_name, color, created_at) VALUES(:name, :parent, :color, :created)');
+    $stmt->execute([':name' => $tagEntry['name'], ':parent' => $tagEntry['parent_name'], ':color' => $defaultColor, ':created' => now_utc()]);
+    $stmt = $pdo->prepare("UPDATE tags SET parent_name = :parent WHERE name = :name AND (parent_name IS NULL OR parent_name = '' OR parent_name = name)");
+    $stmt->execute([':name' => $tagEntry['name'], ':parent' => $tagEntry['parent_name']]);
+    return (int) $pdo->query('SELECT id FROM tags WHERE name = ' . $pdo->quote($tagEntry['name']))->fetchColumn();
 }
 
 function transaction_tag_names(PDO $pdo, array $transactionIds): array
@@ -142,7 +253,7 @@ function transaction_tag_names(PDO $pdo, array $transactionIds): array
     $stmt->execute($transactionIds);
     $result = [];
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $result[(string) $row['id']] = (string) $row['tag_names'];
+        $result[(string) $row['id']] = display_tag_names_from_list((string) $row['tag_names']);
     }
     return $result;
 }
@@ -150,7 +261,7 @@ function transaction_tag_names(PDO $pdo, array $transactionIds): array
 function set_transaction_tags(int $transactionId, string $tagText, bool $batchSameName): array
 {
     $pdo = db();
-    $names = parse_tag_names($tagText);
+    $tagEntries = parse_tag_names($tagText);
 
     $txStmt = $pdo->prepare('SELECT id, source_type, counterparty_key FROM transactions WHERE id = :id');
     $txStmt->execute([':id' => $transactionId]);
@@ -169,10 +280,8 @@ function set_transaction_tags(int $transactionId, string $tagText, bool $batchSa
 
     $pdo->beginTransaction();
     $tagIds = [];
-    foreach ($names as $name) {
-        $stmt = $pdo->prepare('INSERT OR IGNORE INTO tags(name, created_at) VALUES(:name, :created)');
-        $stmt->execute([':name' => $name, ':created' => now_utc()]);
-        $tagIds[] = (int) $pdo->query('SELECT id FROM tags WHERE name = ' . $pdo->quote($name))->fetchColumn();
+    foreach ($tagEntries as $tagEntry) {
+        $tagIds[] = find_or_create_tag($pdo, $tagEntry);
     }
     $delete = $pdo->prepare('DELETE FROM transaction_tags WHERE transaction_id = :tx');
     $insert = $pdo->prepare('INSERT INTO transaction_tags(transaction_id, tag_id, origin, created_at) VALUES(:tx, :tag, :origin, :created)');
@@ -196,15 +305,17 @@ function handle_tag_action(string $action): array
     $pdo = db();
     if ($action === 'create_tag') {
         $name = trim((string) ($_POST['name'] ?? ''));
+        $parentName = trim((string) ($_POST['parent_name'] ?? ''));
         $color = normalize_tag_color((string) ($_POST['color'] ?? '#3b82f6'));
         if ($name === '') return ['ok' => false, 'message' => 'Tag 名称不能为空。'];
+        if ($parentName === '') $parentName = $name;
         try {
-            $stmt = $pdo->prepare('INSERT INTO tags(name, color, created_at) VALUES(:name, :color, :created)');
-            $stmt->execute([':name' => $name, ':color' => $color, ':created' => now_utc()]);
+            $stmt = $pdo->prepare('INSERT INTO tags(name, parent_name, color, created_at) VALUES(:name, :parent, :color, :created)');
+            $stmt->execute([':name' => $name, ':parent' => $parentName, ':color' => $color, ':created' => now_utc()]);
         } catch (PDOException) {
             return ['ok' => false, 'message' => 'Tag 名称已存在。'];
         }
-        $tag = ['id' => (int) $pdo->lastInsertId(), 'name' => $name, 'color' => $color, 'usage_count' => 0];
+        $tag = ['id' => (int) $pdo->lastInsertId(), 'name' => $name, 'parent_name' => $parentName, 'color' => $color, 'usage_count' => 0];
         return ['ok' => true, 'message' => 'Tag 已新增。', 'tag' => $tag, 'row_html' => render_tag_management_row($tag)];
     }
 
@@ -216,17 +327,18 @@ function handle_tag_action(string $action): array
     }
 
     $name = trim((string) ($_POST['name'] ?? ''));
+    $parentName = trim((string) ($_POST['parent_name'] ?? ''));
     $color = normalize_tag_color((string) ($_POST['color'] ?? '#3b82f6'));
     if ($name === '') return ['ok' => false, 'message' => 'Tag 名称不能为空。'];
+    if ($parentName === '') $parentName = $name;
     try {
-        $stmt = $pdo->prepare('UPDATE tags SET name = :name, color = :color WHERE id = :id');
-        $stmt->execute([':name' => $name, ':color' => $color, ':id' => $id]);
+        $stmt = $pdo->prepare('UPDATE tags SET name = :name, parent_name = :parent, color = :color WHERE id = :id');
+        $stmt->execute([':name' => $name, ':parent' => $parentName, ':color' => $color, ':id' => $id]);
     } catch (PDOException) {
         return ['ok' => false, 'message' => 'Tag 名称已存在。'];
     }
     return ['ok' => true, 'message' => 'Tag 已更新。'];
 }
-
 function tag_color_palette(): array
 {
     return [
@@ -268,6 +380,7 @@ function save_settings(array $config): void
 function render_page(string $page, array $config): void
 {
     $flash = flash();
+    $csrfToken = csrf_token();
     ?>
 <!doctype html>
 <html lang="zh-CN">
@@ -300,6 +413,18 @@ function render_page(string $page, array $config): void
         .tag-color-option.is-selected { border-color: #212529; box-shadow: 0 0 0 2px #fff inset; }
         .tag-color-trigger { width: 3rem; height: 2.4rem; padding: .3rem; }
         .tag-color-swatch { display: block; width: 100%; height: 100%; border-radius: .2rem; border: 1px solid rgba(0,0,0,.15); }
+        .import-table { table-layout: fixed; width: 100%; min-width: 960px; }
+        .import-table th, .import-table td { overflow: hidden; }
+        .import-cell-wrap { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+        .import-time { white-space: nowrap; }
+        .import-error { width: 100%; max-height: 5rem; overflow: auto; white-space: pre-wrap; font-size: .85rem; }
+        .tag-page { --tag-page-offset: 8.25rem; }
+        @media (min-width: 992px) {
+            .tag-page { min-height: calc(100vh - var(--tag-page-offset)); }
+            .tag-page > [class*="col-"] { min-height: 0; }
+            .tag-list-card { max-height: calc(100vh - var(--tag-page-offset)); display: flex; flex-direction: column; }
+            .tag-list-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+        }
     </style>
 </head>
 <body>
@@ -314,12 +439,13 @@ function render_page(string $page, array $config): void
             <ul class="navbar-nav me-auto mb-2 mb-lg-0">
                 <li class="nav-item"><a class="nav-link <?= $page === 'charts' ? 'active' : '' ?>" href="?page=charts"><i class="bi bi-pie-chart me-1"></i>支出图表</a></li>
                 <li class="nav-item"><a class="nav-link <?= $page === 'transactions' ? 'active' : '' ?>" href="?page=transactions"><i class="bi bi-receipt me-1"></i>交易</a></li>
+                <li class="nav-item"><a class="nav-link <?= $page === 'untagged' ? 'active' : '' ?>" href="?page=untagged"><i class="bi bi-check2-square me-1"></i>未标记</a></li>
                 <li class="nav-item"><a class="nav-link <?= $page === 'tags' ? 'active' : '' ?>" href="?page=tags"><i class="bi bi-tags me-1"></i>Tag 管理</a></li>
                 <li class="nav-item"><a class="nav-link <?= $page === 'upload' ? 'active' : '' ?>" href="?page=upload"><i class="bi bi-upload me-1"></i>上传</a></li>
                 <li class="nav-item"><a class="nav-link <?= $page === 'settings' ? 'active' : '' ?>" href="?page=settings"><i class="bi bi-gear me-1"></i>设置</a></li>
             </ul>
             <form method="post" class="mb-0">
-                <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+                <input type="hidden" name="csrf" value="<?= h($csrfToken) ?>">
                 <input type="hidden" name="action" value="logout">
                 <button type="submit" class="btn btn-outline-secondary btn-sm">退出</button>
             </form>
@@ -338,6 +464,8 @@ function render_page(string $page, array $config): void
         render_settings($config);
     } elseif ($page === 'tags') {
         render_tags_page();
+    } elseif ($page === 'untagged') {
+        render_untagged_expenses_page();
     } elseif ($page === 'charts') {
         render_charts_page();
     } else {
@@ -552,29 +680,144 @@ document.addEventListener('DOMContentLoaded', () => {
         try { const result = await postAjax(data); button.closest('tr').remove(); showPageFeedback(result.message, true); } catch (error) { showPageFeedback(error.message, false); }
     });
 
+    document.getElementById('bulkSaveTags')?.addEventListener('click', async (event) => {
+        const button = event.currentTarget;
+        const forms = [...document.querySelectorAll('#tagRows .ajax-tag-form[data-action="update_tag"]')];
+        if (!forms.length) return;
+        button.disabled = true;
+        const originalText = button.textContent;
+        let saved = 0;
+        try {
+            for (const form of forms) {
+                button.textContent = `保存中 ${saved + 1}/${forms.length}`;
+                await postAjax(new FormData(form));
+                saved += 1;
+            }
+            showPageFeedback(`已批量保存 ${saved} 个 Tag。`, true);
+        } catch (error) {
+            showPageFeedback(`批量保存中断：已保存 ${saved} 个，${error.message}`, false);
+        } finally {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    });
+
     if (window.tagExpenseChartData && document.getElementById('tagExpenseChart')) {
         const source = window.tagExpenseChartData;
         const filters = [...document.querySelectorAll('[data-tag-chart-filter]')];
         const chart = new Chart(document.getElementById('tagExpenseChart'), {
-            type: 'doughnut',
-            data: {labels: [], datasets: [{data: [], backgroundColor: [], borderWidth: 2, borderColor: '#fff'}]},
-            options: {responsive: true, maintainAspectRatio: false, cutout: '58%', plugins: {legend: {display: false}, tooltip: {callbacks: {label: context => { const total = context.dataset.data.reduce((a, b) => a + b, 0); return `${context.label}: ${Math.round(context.raw).toLocaleString()} (${total ? (context.raw / total * 100).toFixed(1) : 0}%)`; }}}}}
+            type: 'bar',
+            data: {labels: [], datasets: []},
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {mode: 'nearest', intersect: true},
+                plugins: {
+                    legend: {display: false},
+                    tooltip: {enabled: false, external: renderChartTooltip}
+                },
+                scales: {
+                    x: {stacked: true, grid: {display: false}},
+                    y: {stacked: true, beginAtZero: true, ticks: {callback: value => Number(value).toLocaleString()}}
+                }
+            }
         });
+
+        function chartColor(color, alpha) {
+            const value = (color || '').trim();
+            if (!/^#[0-9a-f]{6}$/i.test(value)) return color || '#adb5bd';
+            const r = parseInt(value.slice(1, 3), 16);
+            const g = parseInt(value.slice(3, 5), 16);
+            const b = parseInt(value.slice(5, 7), 16);
+            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        }
+
+        function renderChartTooltip(context) {
+            const {chart, tooltip} = context;
+            let element = chart.canvas.parentNode.querySelector('.chart-tooltip');
+            if (!element) {
+                element = document.createElement('div');
+                element.className = 'chart-tooltip position-absolute bg-dark text-white rounded shadow-sm px-3 py-2 small';
+                element.style.pointerEvents = 'none';
+                element.style.zIndex = '20';
+                element.style.maxWidth = '18rem';
+                chart.canvas.parentNode.style.position = 'relative';
+                chart.canvas.parentNode.appendChild(element);
+            }
+            if (tooltip.opacity === 0 || !tooltip.dataPoints?.length) {
+                element.style.opacity = '0';
+                return;
+            }
+            const point = tooltip.dataPoints[0];
+            const category = point.label;
+            const month = point.dataset.month;
+            const isCurrent = month === (source.months?.[1] || '');
+            const rows = (source.segments || [])
+                .filter(segment => segment.category === category)
+                .map(segment => ({name: segment.subcategory, amount: Number(isCurrent ? segment.current : segment.previous || 0)}))
+                .filter(row => row.amount > 0)
+                .sort((a, b) => b.amount - a.amount);
+            const total = rows.reduce((sum, row) => sum + row.amount, 0);
+            element.innerHTML = `<div class="fw-semibold mb-1">${month} / ${category}</div>`
+                + rows.map(row => `<div class="d-flex justify-content-between gap-3"><span>${row.name}</span><span>${Math.round(row.amount).toLocaleString()}</span></div>`).join('')
+                + `<div class="border-top border-secondary mt-1 pt-1 d-flex justify-content-between gap-3"><span>合计</span><span>${Math.round(total).toLocaleString()}</span></div>`;
+            const {offsetLeft, offsetTop} = chart.canvas;
+            const parentWidth = chart.canvas.parentNode.clientWidth || chart.width;
+            const parentHeight = chart.canvas.parentNode.clientHeight || chart.height;
+            const x = offsetLeft + tooltip.caretX;
+            const y = offsetTop + tooltip.caretY;
+            element.style.opacity = '1';
+            const left = Math.max(8, Math.min(x + 12, parentWidth - element.offsetWidth - 8));
+            const top = Math.max(8, Math.min(y - element.offsetHeight / 2, parentHeight - element.offsetHeight - 8));
+            element.style.left = `${left}px`;
+            element.style.top = `${top}px`;
+        }
 
         function updateTagExpenseChart() {
             const selected = filters.filter(filter => filter.checked).map(filter => Number(filter.dataset.tagChartFilter));
-            const total = selected.reduce((sum, index) => sum + Number(source.values[index] || 0), 0);
-            chart.data.labels = selected.map(index => source.labels[index]);
-            chart.data.datasets[0].data = selected.map(index => source.values[index]);
-            chart.data.datasets[0].backgroundColor = selected.map(index => source.colors[index]);
+            const selectedCategories = selected.map(index => source.labels[index]);
+            const total = selected.reduce((sum, index) => sum + Number(source.currentValues[index] || 0), 0);
+            const previousTotal = selected.reduce((sum, index) => sum + Number(source.previousValues[index] || 0), 0);
+            chart.data.labels = selectedCategories;
+            chart.data.datasets = [];
+            (source.segments || []).forEach(segment => {
+                if (!selectedCategories.includes(segment.category)) return;
+                const previousData = selectedCategories.map(category => category === segment.category ? Number(segment.previous || 0) : 0);
+                const currentData = selectedCategories.map(category => category === segment.category ? Number(segment.current || 0) : 0);
+                if (previousData.some(Boolean)) {
+                    chart.data.datasets.push({
+                        label: segment.label,
+                        subcategory: segment.subcategory,
+                        month: source.months?.[0] || '',
+                        data: previousData,
+                        backgroundColor: chartColor(segment.color, 0.45),
+                        borderColor: '#fff',
+                        borderWidth: 1,
+                        stack: 'previous'
+                    });
+                }
+                if (currentData.some(Boolean)) {
+                    chart.data.datasets.push({
+                        label: segment.label,
+                        subcategory: segment.subcategory,
+                        month: source.months?.[1] || '',
+                        data: currentData,
+                        backgroundColor: segment.color || '#adb5bd',
+                        borderColor: '#fff',
+                        borderWidth: 1,
+                        stack: 'current'
+                    });
+                }
+            });
             chart.update();
             document.getElementById('tagExpenseTotal').textContent = Math.round(total).toLocaleString();
+            const previousTotalElement = document.getElementById('tagExpensePreviousTotal');
+            if (previousTotalElement) previousTotalElement.textContent = Math.round(previousTotal).toLocaleString();
             document.querySelectorAll('[data-tag-chart-row]').forEach(row => {
                 const index = Number(row.dataset.tagChartRow);
                 const visible = selected.includes(index);
-                row.classList.toggle('d-none', !visible);
-                const percent = row.querySelector('[data-tag-chart-percent]');
-                if (percent) percent.textContent = `${total ? (Number(source.values[index]) / total * 100).toFixed(1) : '0.0'}%`;
+                row.classList.toggle('table-light', !visible);
+                row.classList.toggle('text-body-secondary', !visible);
             });
         }
 
@@ -635,20 +878,28 @@ function render_upload(): void
 </div>
 <div class="card shadow-sm">
     <div class="card-body">
-        <h2 class="h5 mb-3">最近导入</h2>
+        <div class="d-flex flex-column flex-md-row gap-2 justify-content-between align-items-md-center mb-3">
+            <h2 class="h5 mb-0">最近导入</h2>
+            <form method="post" onsubmit="return confirm('\u786e\u5b9a\u6e05\u9664\u6240\u6709\u5931\u8d25\u5bfc\u5165\u8bb0\u5f55\uff1f');">
+                <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+                <input type="hidden" name="action" value="clear_failed_imports">
+                <button type="submit" class="btn btn-outline-danger btn-sm">清除失败记录</button>
+            </form>
+        </div>
         <div class="table-responsive">
-            <table class="table table-sm table-hover align-middle mb-0">
+            <table class="table table-sm table-hover align-middle mb-0 import-table">
+                <colgroup><col style="width:13%"><col style="width:25%"><col style="width:11%"><col style="width:7%"><col style="width:6%"><col style="width:6%"><col style="width:32%"></colgroup>
                 <thead><tr><th>时间</th><th>文件</th><th>来源</th><th>状态</th><th>新增</th><th>重复</th><th>错误</th></tr></thead>
                 <tbody>
                 <?php foreach ($imports as $import): ?>
                     <tr>
-                        <td><?= h($import['created_at']) ?></td>
-                        <td><?= h($import['filename']) ?></td>
-                        <td><?= h(source_label((string) $import['source_type'])) ?></td>
+                        <td class="import-time"><?= h($import['created_at']) ?></td>
+                        <td><div class="import-cell-wrap"><?= h($import['filename']) ?></div></td>
+                        <td><div class="import-cell-wrap"><?= h(source_label((string) $import['source_type'])) ?></div></td>
                         <td><span class="badge text-bg-<?= $import['status'] === 'success' ? 'success' : ($import['status'] === 'failed' ? 'danger' : 'secondary') ?>"><?= h(status_label((string) $import['status'])) ?></span></td>
                         <td><?= h((string) $import['inserted_count']) ?></td>
                         <td><?= h((string) $import['duplicate_count']) ?></td>
-                        <td><?= h($import['error_message']) ?></td>
+                        <td><div class="import-cell-wrap import-error"><?= h($import['error_message']) ?></div></td>
                     </tr>
                 <?php endforeach; ?>
                 </tbody>
@@ -708,7 +959,7 @@ function render_transactions(): void
     $stmt->execute($params);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $childrenByParent = load_children_by_parent(array_map(static fn(array $row): int => (int) $row['id'], $rows));
-    $tags = db()->query('SELECT name FROM tags ORDER BY name')->fetchAll(PDO::FETCH_COLUMN);
+    $tags = available_tag_names(db());
     ?>
 <div class="card shadow-sm mb-4">
     <div class="card-body">
@@ -852,7 +1103,7 @@ function render_description(array $row): string
 
 function render_tag_edit_button(array $row): string
 {
-    $tags = (string) ($row['tag_names'] ?? '');
+    $tags = display_tag_names_from_list((string) ($row['tag_names'] ?? ''));
     return '<button type="button" class="btn btn-outline-primary btn-sm" data-bs-toggle="modal" data-bs-target="#tagModal"'
         . ' data-transaction-id="' . h((string) $row['id']) . '"'
         . ' data-description="' . h((string) $row['description']) . '"'
@@ -912,7 +1163,7 @@ function render_tag_modal(array $tagNames): string
 
 function render_tag_badges(string $tagNames): string
 {
-    $names = array_filter(array_map('trim', explode(',', $tagNames)));
+    $names = array_filter(array_map('display_tag_name', array_map('trim', explode(',', $tagNames))));
     if (!$names) {
         return '<span class="text-body-secondary small">无标签</span>';
     }
@@ -944,11 +1195,123 @@ function status_label(string $status): string
     };
 }
 
+function untagged_expense_base_condition(string $effectiveDate): string
+{
+    return "t.direction = 'expense'
+        AND NOT EXISTS (SELECT 1 FROM transaction_tags tt WHERE tt.transaction_id = t.id)
+        AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement')
+        AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id))";
+}
+
+function render_untagged_expenses_page(): void
+{
+    $pdo = db();
+    $effectiveDate = "CASE WHEN t.source_type IN ('paypay_card', 'epos_card') AND t.payment_date IS NOT NULL THEN t.payment_date ELSE t.transaction_date END";
+    $baseCondition = untagged_expense_base_condition($effectiveDate);
+    $latestStmt = $pdo->query("SELECT substr($effectiveDate, 1, 7) FROM transactions t WHERE $baseCondition ORDER BY substr($effectiveDate, 1, 7) DESC LIMIT 1");
+    $latestMonth = (string) ($latestStmt->fetchColumn() ?: date('Y-m'));
+    $month = preg_match('/^\d{4}-\d{2}$/', (string) ($_GET['month'] ?? '')) ? (string) $_GET['month'] : $latestMonth;
+    $sourceFilter = (string) ($_GET['source'] ?? '');
+    $sourceFilter = in_array($sourceFilter, ['mufg_bank', 'paypay_card', 'epos_card'], true) ? $sourceFilter : '';
+    $keyword = trim((string) ($_GET['keyword'] ?? ''));
+    if (strlen($keyword) > 100) $keyword = substr($keyword, 0, 100);
+    $where = [$baseCondition, "substr($effectiveDate, 1, 7) = :month"];
+    $params = [':month' => $month];
+    if ($sourceFilter !== '') {
+        $where[] = 't.source_type = :source_type';
+        $params[':source_type'] = $sourceFilter;
+    }
+    if ($keyword !== '') {
+        $where[] = '(t.description LIKE :keyword OR t.counterparty_key LIKE :keyword)';
+        $params[':keyword'] = '%' . $keyword . '%';
+    }
+
+    $stmt = $pdo->prepare("
+        SELECT t.*, $effectiveDate AS effective_date
+        FROM transactions t
+        WHERE " . implode(' AND ', $where) . "
+        ORDER BY effective_date DESC, t.transaction_date DESC, t.id DESC
+        LIMIT 500
+    ");
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $total = array_sum(array_map(static fn(array $row): int => (int) $row['amount'], $rows));
+    $tags = available_tag_names($pdo);
+    ?>
+<div class="card shadow-sm mb-4">
+    <div class="card-body">
+        <div class="d-flex flex-column flex-lg-row gap-2 justify-content-between align-items-lg-center mb-3">
+            <div>
+                <h1 class="h4 mb-1">未标记支出</h1>
+                <div class="text-body-secondary small">信用卡按付款月份归属；可选择多条记录并批量添加一个 Tag。</div>
+            </div>
+            <form method="get" class="row g-2 align-items-end">
+                <input type="hidden" name="page" value="untagged">
+                <div class="col-6 col-md-auto"><label class="form-label small">月份</label><input type="month" name="month" class="form-control" value="<?= h($month) ?>" onchange="this.form.submit()"></div>
+                <div class="col-6 col-md-auto"><label class="form-label small">来源</label><select name="source" class="form-select" onchange="this.form.submit()"><option value="">全部来源</option><?php foreach (['mufg_bank', 'paypay_card', 'epos_card'] as $sourceOption): ?><option value="<?= h($sourceOption) ?>" <?= $sourceFilter === $sourceOption ? 'selected' : '' ?>><?= h(source_label($sourceOption)) ?></option><?php endforeach; ?></select></div>
+                <div class="col-12 col-md-auto"><label class="form-label small">关键词</label><input name="keyword" class="form-control" value="<?= h($keyword) ?>" placeholder="描述或店铺"></div>
+                <div class="col-12 col-md-auto d-flex gap-2"><button class="btn btn-primary" type="submit">筛选</button><a class="btn btn-outline-secondary" href="?page=untagged&amp;month=<?= h($month) ?>">重置</a></div>
+            </form>
+        </div>
+        <div class="row g-3 align-items-end">
+            <div class="col-12 col-md-auto"><div class="text-body-secondary small">当前月份</div><div class="fs-5 fw-semibold"><?= h($month) ?></div></div>
+            <div class="col-12 col-md-auto"><div class="text-body-secondary small">未标记笔数</div><div class="fs-5 fw-semibold"><?= h((string) count($rows)) ?></div></div>
+            <div class="col-12 col-md-auto"><div class="text-body-secondary small">合计金额</div><div class="fs-5 fw-semibold"><?= number_format($total) ?></div></div>
+        </div>
+    </div>
+</div>
+<form method="post" class="card shadow-sm border-0">
+    <div class="card-body border-bottom">
+        <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
+        <input type="hidden" name="action" value="bulk_tag_untagged">
+        <input type="hidden" name="month" value="<?= h($month) ?>">
+        <input type="hidden" name="source" value="<?= h($sourceFilter) ?>">
+        <input type="hidden" name="keyword" value="<?= h($keyword) ?>">
+        <div class="row g-3 align-items-end">
+            <div class="col-12 col-md-5 col-lg-4">
+                <label class="form-label">添加 Tag</label>
+                <input name="tag_name" class="form-control" list="bulkTagNames" placeholder="输入或选择一个 Tag" required>
+                <datalist id="bulkTagNames"><?php foreach ($tags as $name): ?><option value="<?= h($name) ?>"></option><?php endforeach; ?></datalist>
+            </div>
+            <div class="col-12 col-md-auto">
+                <button class="btn btn-primary" type="submit" <?= !$rows ? 'disabled' : '' ?>>批量添加</button>
+            </div>
+        </div>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0 transaction-table">
+            <thead class="table-light"><tr><th style="width:3rem"><input class="form-check-input" type="checkbox" id="untaggedSelectAll"></th><th>归属日期</th><th>消费日期</th><th>来源</th><th>描述</th><th class="text-end">金额</th></tr></thead>
+            <tbody>
+            <?php foreach ($rows as $row): ?>
+                <tr>
+                    <td><input class="form-check-input untagged-row-check" type="checkbox" name="transaction_ids[]" value="<?= h((string) $row['id']) ?>"></td>
+                    <td class="text-body-secondary"><?= h((string) $row['effective_date']) ?></td>
+                    <td><?= h((string) $row['transaction_date']) ?></td>
+                    <td><span class="badge text-bg-light border"><?= h(source_label((string) $row['source_type'])) ?></span></td>
+                    <td><?= render_description($row) ?><?php if (!empty($row['payment_date'])): ?><div class="text-body-secondary description-subline">付款日：<?= h((string) $row['payment_date']) ?></div><?php endif; ?></td>
+                    <td class="text-end amount-cell amount-expense">-<?= number_format((int) $row['amount']) ?></td>
+                </tr>
+            <?php endforeach; ?>
+            <?php if (!$rows): ?><tr><td colspan="6" class="text-center text-body-secondary py-4">该月份没有未标记支出。</td></tr><?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+</form>
+<script>
+document.getElementById('untaggedSelectAll')?.addEventListener('change', event => {
+    document.querySelectorAll('.untagged-row-check').forEach(input => { input.checked = event.target.checked; });
+});
+</script>
+<?php
+}
+
 function render_tags_page(): void
 {
-    $tags = db()->query("SELECT g.id, g.name, g.color, COUNT(tt.transaction_id) AS usage_count FROM tags g LEFT JOIN transaction_tags tt ON tt.tag_id = g.id GROUP BY g.id ORDER BY g.name")->fetchAll(PDO::FETCH_ASSOC);
+    $pdo = db();
+    $tags = $pdo->query("SELECT g.id, g.name, COALESCE(NULLIF(g.parent_name, ''), g.name) AS parent_name, g.color, COUNT(tt.transaction_id) AS usage_count FROM tags g LEFT JOIN transaction_tags tt ON tt.tag_id = g.id GROUP BY g.id ORDER BY parent_name, g.name")->fetchAll(PDO::FETCH_ASSOC);
+    $parentNames = $pdo->query("SELECT DISTINCT COALESCE(NULLIF(parent_name, ''), name) AS parent_name FROM tags ORDER BY parent_name")->fetchAll(PDO::FETCH_COLUMN);
     ?>
-<div class="row g-4">
+<div class="row g-4 tag-page">
     <div class="col-12 col-lg-4">
         <div class="card shadow-sm border-0">
             <div class="card-body">
@@ -956,7 +1319,8 @@ function render_tags_page(): void
                 <form class="ajax-tag-form" data-action="create_tag">
                     <input type="hidden" name="csrf" value="<?= h(csrf_token()) ?>">
                     <input type="hidden" name="action" value="create_tag">
-                    <div class="mb-3"><label class="form-label">名称</label><input name="name" class="form-control" required></div>
+                    <div class="mb-3"><label class="form-label">大类</label><input name="parent_name" class="form-control" list="tagParentNames" placeholder="留空时使用小类名称"></div>
+                    <div class="mb-3"><label class="form-label">小类名称</label><input name="name" class="form-control" required></div>
                     <div class="mb-3"><label class="form-label">颜色</label><?= render_tag_color_picker('#3b82f6') ?></div>
                     <button class="btn btn-primary" type="submit"><i class="bi bi-plus-lg me-1"></i>新增</button>
                 </form>
@@ -964,18 +1328,20 @@ function render_tags_page(): void
         </div>
     </div>
     <div class="col-12 col-lg-8">
-        <div class="card shadow-sm border-0">
-            <div class="card-body border-bottom d-flex justify-content-between align-items-center">
-                <h2 class="h5 mb-0">Tag 列表</h2><span class="text-body-secondary small">平面标签，无层级关系</span>
+        <div class="card shadow-sm border-0 tag-list-card">
+            <div class="card-body border-bottom d-flex flex-column flex-md-row gap-2 justify-content-between align-items-md-center">
+                <div><h2 class="h5 mb-0">Tag 列表</h2><span class="text-body-secondary small">交易绑定小类，图表按大类汇总</span></div>
+                <button type="button" class="btn btn-primary btn-sm" id="bulkSaveTags">批量保存</button>
             </div>
-            <div class="table-responsive">
-                <table class="table align-middle mb-0"><thead class="table-light"><tr><th>颜色</th><th>名称</th><th>使用次数</th><th class="text-end">操作</th></tr></thead><tbody id="tagRows">
+            <div class="table-responsive tag-list-scroll">
+                <table class="table align-middle mb-0"><thead class="table-light"><tr><th>颜色</th><th>大类</th><th>小类</th><th>使用次数</th><th class="text-end">操作</th></tr></thead><tbody id="tagRows">
                 <?php foreach ($tags as $tag): ?><?= render_tag_management_row($tag) ?><?php endforeach; ?>
                 </tbody></table>
             </div>
         </div>
     </div>
 </div>
+<datalist id="tagParentNames"><?php foreach ($parentNames as $parentName): ?><option value="<?= h((string) $parentName) ?>"></option><?php endforeach; ?></datalist>
 <div id="tagPageFeedback" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 <?php
 }
@@ -1009,6 +1375,7 @@ function render_tag_management_row(array $tag): string
     ob_start(); ?>
 <tr data-tag-row="<?= h((string) $tag['id']) ?>">
     <td><?= render_tag_color_picker((string) $tag['color'], $formId) ?></td>
+    <td><input form="<?= h($formId) ?>" name="parent_name" class="form-control" list="tagParentNames" value="<?= h((string) ($tag['parent_name'] ?? $tag['name'])) ?>"></td>
     <td><input form="<?= h($formId) ?>" name="name" class="form-control" value="<?= h((string) $tag['name']) ?>" required></td>
     <td><span class="badge text-bg-light border"><?= h((string) $tag['usage_count']) ?></span></td>
     <td class="text-end">
@@ -1025,68 +1392,152 @@ function render_tag_management_row(array $tag): string
 
 function render_charts_page(): void
 {
-    $pdo = db();
-    $latestDate = (string) ($pdo->query("SELECT MAX(transaction_date) FROM transactions WHERE direction = 'expense'")->fetchColumn() ?: date('Y-m-d'));
-    $scope = (string) ($_GET['scope'] ?? 'month');
-    $scope = in_array($scope, ['month', 'year'], true) ? $scope : 'month';
-    $month = preg_match('/^\\d{4}-\\d{2}$/', (string) ($_GET['month'] ?? '')) ? (string) $_GET['month'] : substr($latestDate, 0, 7);
-    $year = preg_match('/^\\d{4}$/', (string) ($_GET['year'] ?? '')) ? (string) $_GET['year'] : substr($latestDate, 0, 4);
-    $period = $scope === 'year' ? $year : $month;
-    $rows = expense_tag_statistics($period, $scope);
-    $defaultVisibleRows = array_values(array_filter($rows, static fn(array $row): bool => (string) $row['name'] !== '提现'));
-    $defaultVisibleTotal = array_sum(array_column($defaultVisibleRows, 'amount'));
+    $month = preg_match('/^\d{4}-\d{2}$/', (string) ($_GET['month'] ?? '')) ? (string) $_GET['month'] : date('Y-m');
+    $previousMonth = (new DateTimeImmutable($month . '-01'))->modify('-1 month')->format('Y-m');
+    $nextMonth = (new DateTimeImmutable($month . '-01'))->modify('+1 month')->format('Y-m');
+    $currentRows = expense_tag_statistics($month);
+    $previousRows = expense_tag_statistics($previousMonth);
+    $rows = expense_category_comparison($currentRows, $previousRows);
+    $segments = expense_subcategory_comparison($currentRows, $previousRows);
+    $defaultVisibleRows = array_values(array_filter($rows, static fn(array $row): bool => (string) $row['category_name'] !== '提现'));
+    $defaultVisibleTotal = array_sum(array_column($defaultVisibleRows, 'current_amount'));
+    $defaultVisiblePreviousTotal = array_sum(array_column($defaultVisibleRows, 'previous_amount'));
     ?>
 <div class="card shadow-sm border-0 mb-4"><div class="card-body">
     <div class="d-flex flex-column flex-lg-row justify-content-between gap-3 align-items-lg-end">
-        <div><h1 class="h4 mb-1">Tag 支出比例</h1><div class="text-body-secondary small">信用卡明细按付款月份统计；多 Tag 交易平均分摊；信用卡总扣款不重复计算。</div></div>
+        <div><h1 class="h4 mb-1">大类/小类叠加月度对比</h1><div class="text-body-secondary small">每个大类显示 <?= h($previousMonth) ?> 和 <?= h($month) ?> 两根柱，柱内按小类叠加；信用卡明细按付款月份统计。</div></div>
         <form method="get" class="d-flex flex-wrap gap-2 align-items-end"><input type="hidden" name="page" value="charts">
-            <div><label class="form-label small">统计范围</label><select name="scope" class="form-select"><option value="month" <?= $scope === 'month' ? 'selected' : '' ?>>月份</option><option value="year" <?= $scope === 'year' ? 'selected' : '' ?>>全年</option></select></div>
-            <div><label class="form-label small">月份</label><input type="month" name="month" class="form-control" value="<?= h($month) ?>"></div>
-            <div><label class="form-label small">年份</label><input type="number" name="year" class="form-control" min="2000" max="2100" value="<?= h($year) ?>"></div>
-            <button class="btn btn-primary" type="submit">查看</button>
+            <div><label class="form-label small">当前月</label><input type="month" name="month" class="form-control" value="<?= h($month) ?>" onchange="this.form.submit()"></div>
+            <div class="btn-group" role="group" aria-label="月份切换">
+                <a class="btn btn-outline-secondary" href="?page=charts&amp;month=<?= h($previousMonth) ?>">上月</a>
+                <a class="btn btn-outline-secondary" href="?page=charts&amp;month=<?= h($nextMonth) ?>">下月</a>
+            </div>
         </form>
     </div>
 </div></div>
-<div class="card shadow-sm border-0 mb-4"><div class="card-body py-3">
-    <div class="d-flex flex-wrap gap-3 align-items-center" id="tagExpenseFilters">
-        <span class="small fw-semibold text-body-secondary">显示分类</span>
-        <?php foreach ($rows as $index => $row): ?>
-        <div class="form-check form-check-inline m-0">
-            <input class="form-check-input" type="checkbox" id="tag-filter-<?= h((string) $index) ?>" data-tag-chart-filter="<?= h((string) $index) ?>" <?= (string) $row['name'] !== '提现' ? 'checked' : '' ?>>
-            <label class="form-check-label d-inline-flex align-items-center gap-1" for="tag-filter-<?= h((string) $index) ?>"><span class="rounded-1 d-inline-block" style="width:10px;height:10px;background:<?= h($row['color']) ?>"></span><?= h($row['name']) ?></label>
-        </div>
-        <?php endforeach; ?>
-    </div>
-</div></div>
-<div class="row g-4"><div class="col-12 col-xl-7"><div class="card shadow-sm border-0"><div class="card-body"><div style="height:420px"><canvas id="tagExpenseChart"></canvas></div></div></div></div>
-<div class="col-12 col-xl-5"><div class="card shadow-sm border-0"><div class="card-body border-bottom"><div class="text-body-secondary small"><?= h($period) ?> 总支出</div><div class="fs-3 fw-semibold" id="tagExpenseTotal"><?= number_format((int) round($defaultVisibleTotal)) ?></div></div><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Tag</th><th class="text-end">金额</th><th class="text-end">占比</th></tr></thead><tbody><?php foreach ($rows as $index => $row): ?><tr data-tag-chart-row="<?= h((string) $index) ?>" <?= (string) $row['name'] === '提现' ? 'class="d-none"' : '' ?>><td><span class="badge me-2" style="background:<?= h($row['color']) ?>">&nbsp;</span><?= h($row['name']) ?></td><td class="text-end"><?= number_format((int) round($row['amount'])) ?></td><td class="text-end" data-tag-chart-percent><?= $defaultVisibleTotal > 0 ? number_format($row['amount'] / $defaultVisibleTotal * 100, 1) : '0.0' ?>%</td></tr><?php endforeach; ?></tbody></table></div></div></div></div>
-<script>window.tagExpenseChartData = <?= json_encode(['labels' => array_column($rows, 'name'), 'values' => array_column($rows, 'amount'), 'colors' => array_column($rows, 'color')], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
+<div class="row g-4">
+    <div class="col-12 col-xl-7"><div class="card shadow-sm border-0"><div class="card-body"><div style="height:420px"><canvas id="tagExpenseChart"></canvas></div></div></div></div>
+    <div class="col-12 col-xl-5"><div class="card shadow-sm border-0">
+        <div class="card-body border-bottom">
+            <div class="row g-3">
+                <div class="col"><div class="text-body-secondary small"><?= h($month) ?> 当月总支出</div><div class="fs-3 fw-semibold" id="tagExpenseTotal"><?= number_format((int) round($defaultVisibleTotal)) ?></div></div>
+                <div class="col"><div class="text-body-secondary small"><?= h($previousMonth) ?> 上月总支出</div><div class="fs-3 fw-semibold text-body-secondary" id="tagExpensePreviousTotal"><?= number_format((int) round($defaultVisiblePreviousTotal)) ?></div></div>
+            </div>
+        </div><div class="table-responsive"><table class="table mb-0 align-middle"><thead class="table-light"><tr><th style="width:3rem">显示</th><th>大类</th><th class="text-end"><?= h($previousMonth) ?></th><th class="text-end"><?= h($month) ?></th><th class="text-end">增减</th><th class="text-end">增减率</th></tr></thead><tbody><?php foreach ($rows as $index => $row): ?><tr data-tag-chart-row="<?= h((string) $index) ?>" <?= (string) $row['category_name'] === '提现' ? 'class="table-light text-body-secondary"' : '' ?>><td><input class="form-check-input" type="checkbox" aria-label="显示 <?= h($row['category_name']) ?>" data-tag-chart-filter="<?= h((string) $index) ?>" <?= (string) $row['category_name'] !== '提现' ? 'checked' : '' ?>></td><td><?= h($row['category_name']) ?></td><td class="text-end"><?= number_format((int) round($row['previous_amount'])) ?></td><td class="text-end"><?= number_format((int) round($row['current_amount'])) ?></td><td class="text-end <?= $row['delta'] > 0 ? 'amount-expense' : ($row['delta'] < 0 ? 'amount-income' : '') ?>"><?= $row['delta'] > 0 ? '+' : '' ?><?= number_format((int) round($row['delta'])) ?></td><td class="text-end"><?= $row['delta_rate'] === null ? '-' : (($row['delta_rate'] > 0 ? '+' : '') . number_format($row['delta_rate'], 1) . '%') ?></td></tr><?php endforeach; ?><?php if (!$rows): ?><tr><td colspan="6" class="text-center text-body-secondary py-4">没有可对比的支出数据。</td></tr><?php endif; ?></tbody></table></div></div></div></div>
+</div>
+<script>window.tagExpenseChartData = <?= json_encode(['months' => [$previousMonth, $month], 'labels' => array_column($rows, 'category_name'), 'previousValues' => array_column($rows, 'previous_amount'), 'currentValues' => array_column($rows, 'current_amount'), 'segments' => $segments], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
 <?php
 }
 
-function expense_tag_statistics(string $period, string $scope): array
+function expense_tag_statistics(string $period): array
 {
     $pdo = db();
     $effectiveDate = "CASE WHEN t.source_type IN ('paypay_card', 'epos_card') AND t.payment_date IS NOT NULL THEN t.payment_date ELSE t.transaction_date END";
-    $dateCondition = $scope === 'year' ? "substr($effectiveDate, 1, 4) = :period" : "substr($effectiveDate, 1, 7) = :period";
-    $stmt = $pdo->prepare("SELECT t.id, t.amount, g.name, g.color FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.direction = 'expense' AND $dateCondition AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement') AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id)) ORDER BY t.id");
+    $stmt = $pdo->prepare("SELECT t.id, t.amount, COALESCE(NULLIF(g.parent_name, ''), g.name, '未标记') AS category_name, COALESCE(g.name, '未标记') AS subcategory_name, COALESCE(g.color, '#adb5bd') AS color FROM transactions t LEFT JOIN transaction_tags tt ON tt.transaction_id = t.id LEFT JOIN tags g ON g.id = tt.tag_id WHERE t.direction = 'expense' AND substr($effectiveDate, 1, 7) = :period AND NOT EXISTS (SELECT 1 FROM transaction_links l WHERE l.parent_transaction_id = t.id AND l.link_type = 'card_statement') AND NOT EXISTS (SELECT 1 FROM transaction_links cancel_l WHERE cancel_l.link_type = 'cancellation' AND (cancel_l.parent_transaction_id = t.id OR cancel_l.child_transaction_id = t.id)) ORDER BY t.id");
     $stmt->execute([':period' => $period]);
     $transactions = [];
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
         $id = (int) $row['id'];
         $transactions[$id]['amount'] = (int) $row['amount'];
-        if ($row['name'] !== null) $transactions[$id]['tags'][] = ['name' => (string) $row['name'], 'color' => (string) $row['color']];
+        $transactions[$id]['tags'][] = [
+            'category_name' => (string) $row['category_name'],
+            'subcategory_name' => (string) $row['subcategory_name'],
+            'color' => (string) $row['color'],
+        ];
     }
     $totals = [];
     foreach ($transactions as $transaction) {
-        $tags = $transaction['tags'] ?? [['name' => '未标记', 'color' => '#adb5bd']];
+        $tags = $transaction['tags'] ?? [['category_name' => '未标记', 'subcategory_name' => '未标记', 'color' => '#adb5bd']];
         $share = $transaction['amount'] / count($tags);
         foreach ($tags as $tag) {
-            $totals[$tag['name']]['name'] = $tag['name']; $totals[$tag['name']]['color'] = $tag['color']; $totals[$tag['name']]['amount'] = ($totals[$tag['name']]['amount'] ?? 0) + $share;
+            $key = $tag['category_name'] . '||' . $tag['subcategory_name'];
+            $totals[$key]['category_name'] = $tag['category_name'];
+            $totals[$key]['subcategory_name'] = $tag['subcategory_name'];
+            $totals[$key]['label'] = $tag['category_name'] === $tag['subcategory_name'] ? $tag['category_name'] : $tag['category_name'] . ' / ' . $tag['subcategory_name'];
+            $totals[$key]['color'] = $tag['color'];
+            $totals[$key]['amount'] = ($totals[$key]['amount'] ?? 0) + $share;
         }
     }
-    usort($totals, static fn(array $a, array $b): int => $b['amount'] <=> $a['amount']);
+    usort($totals, static function (array $a, array $b): int {
+        $categoryOrder = $a['category_name'] <=> $b['category_name'];
+        if ($categoryOrder !== 0) return $categoryOrder;
+        $amountOrder = $b['amount'] <=> $a['amount'];
+        if ($amountOrder !== 0) return $amountOrder;
+        return $a['subcategory_name'] <=> $b['subcategory_name'];
+    });
     return array_values($totals);
+}
+
+function expense_subcategory_comparison(array $currentRows, array $previousRows): array
+{
+    $rows = [];
+    foreach ($previousRows as $row) {
+        $key = $row['category_name'] . '||' . $row['subcategory_name'];
+        $rows[$key] = [
+            'category' => $row['category_name'],
+            'subcategory' => $row['subcategory_name'],
+            'label' => $row['label'],
+            'color' => $row['color'],
+            'previous' => (float) $row['amount'],
+            'current' => 0.0,
+        ];
+    }
+    foreach ($currentRows as $row) {
+        $key = $row['category_name'] . '||' . $row['subcategory_name'];
+        if (!isset($rows[$key])) {
+            $rows[$key] = [
+                'category' => $row['category_name'],
+                'subcategory' => $row['subcategory_name'],
+                'label' => $row['label'],
+                'color' => $row['color'],
+                'previous' => 0.0,
+                'current' => 0.0,
+            ];
+        }
+        $rows[$key]['current'] = (float) $row['amount'];
+        $rows[$key]['color'] = $row['color'];
+    }
+    usort($rows, static function (array $a, array $b): int {
+        $categoryOrder = $a['category'] <=> $b['category'];
+        if ($categoryOrder !== 0) return $categoryOrder;
+        $amountOrder = ($b['current'] + $b['previous']) <=> ($a['current'] + $a['previous']);
+        if ($amountOrder !== 0) return $amountOrder;
+        return $a['subcategory'] <=> $b['subcategory'];
+    });
+    return array_values($rows);
+}
+
+function expense_category_comparison(array $currentRows, array $previousRows): array
+{
+    $current = expense_category_totals($currentRows);
+    $previous = expense_category_totals($previousRows);
+    $categories = array_values(array_unique(array_merge(array_keys($current), array_keys($previous))));
+    sort($categories, SORT_NATURAL);
+    $rows = [];
+    foreach ($categories as $categoryName) {
+        $currentAmount = (float) ($current[$categoryName] ?? 0);
+        $previousAmount = (float) ($previous[$categoryName] ?? 0);
+        $delta = $currentAmount - $previousAmount;
+        $rows[] = [
+            'category_name' => $categoryName,
+            'current_amount' => $currentAmount,
+            'previous_amount' => $previousAmount,
+            'delta' => $delta,
+            'delta_rate' => $previousAmount > 0 ? $delta / $previousAmount * 100 : null,
+        ];
+    }
+    usort($rows, static fn(array $a, array $b): int => abs($b['delta']) <=> abs($a['delta']));
+    return $rows;
+}
+
+function expense_category_totals(array $rows): array
+{
+    $totals = [];
+    foreach ($rows as $row) {
+        $categoryName = (string) $row['category_name'];
+        $totals[$categoryName] = ($totals[$categoryName] ?? 0) + (float) $row['amount'];
+    }
+    return $totals;
 }
 
 function render_settings(array $config): void

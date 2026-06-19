@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
+    parent_name TEXT,
     color TEXT NOT NULL DEFAULT '#3b82f6',
     created_at TEXT NOT NULL
 );
@@ -97,6 +98,11 @@ CREATE INDEX IF NOT EXISTS idx_transaction_tags_tag ON transaction_tags(tag_id, 
 CREATE INDEX IF NOT EXISTS idx_imports_created ON imports(created_at DESC);
 """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tags)")}
+    if "parent_name" not in columns:
+        conn.execute("ALTER TABLE tags ADD COLUMN parent_name TEXT")
+    conn.execute("UPDATE tags SET parent_name = name WHERE parent_name IS NULL OR parent_name = ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_parent_name ON tags(parent_name, name)")
 
 
 def decode_csv(path: Path) -> str:

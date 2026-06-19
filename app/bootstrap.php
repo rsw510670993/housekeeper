@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
+    parent_name TEXT,
     color TEXT NOT NULL DEFAULT '#3b82f6',
     created_at TEXT NOT NULL
 );
@@ -156,6 +157,12 @@ CREATE INDEX IF NOT EXISTS idx_transaction_links_type_child ON transaction_links
 CREATE INDEX IF NOT EXISTS idx_transaction_tags_tag ON transaction_tags(tag_id, transaction_id);
 CREATE INDEX IF NOT EXISTS idx_imports_created ON imports(created_at DESC);
 SQL);
+    $columns = $pdo->query('PRAGMA table_info(tags)')->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('parent_name', $columns, true)) {
+        $pdo->exec('ALTER TABLE tags ADD COLUMN parent_name TEXT');
+    }
+    $pdo->exec("UPDATE tags SET parent_name = name WHERE parent_name IS NULL OR parent_name = ''");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_tags_parent_name ON tags(parent_name, name)');
     $migrationKey = 'link_reconcile_v1';
     $stmt = $pdo->prepare('SELECT 1 FROM app_meta WHERE key = :key');
     $stmt->execute([':key' => $migrationKey]);
